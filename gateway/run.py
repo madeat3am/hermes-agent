@@ -913,8 +913,14 @@ def _warm_turn_machinery_sync() -> int:
     tool_defs = model_tools.get_tool_definitions(quiet_mode=True)
     try:
         from agent.prompt_builder import build_context_files_prompt
+        from agent.model_metadata import get_model_context_length
 
-        build_context_files_prompt()
+        config = _load_gateway_config()
+        model_config = config.get("model") if isinstance(config, dict) else None
+        model = str(model_config.get("default") or "") if isinstance(model_config, dict) else ""
+        provider = str(model_config.get("provider") or "") if isinstance(model_config, dict) else ""
+        context_length = get_model_context_length(model, provider=provider)
+        build_context_files_prompt(context_length=context_length)
     except Exception:
         logger.debug("context-file warm-up failed (non-fatal)", exc_info=True)
     return len(tool_defs)

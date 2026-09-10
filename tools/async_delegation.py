@@ -232,8 +232,12 @@ def recover_abandoned_delegations() -> int:
                FROM async_delegations WHERE state IN ('running','finalizing')""").fetchall()
         for row in rows:
             delegation_id, session_key, origin_ui, parent_id, dispatched_at, pid, started, task_json, origin_sid = row
-            if pid and _pid_exists(int(pid)) and (started is None or get_process_start_time(int(pid)) == int(started)):
-                continue
+            if pid and _pid_exists(int(pid)):
+                live_started = get_process_start_time(int(pid))
+                # A mismatch proves PID reuse. Missing start identity proves
+                # nothing, so preserve a row whose owner PID is still live.
+                if started is None or live_started is None or int(live_started) == int(started):
+                    continue
             task = json.loads(task_json or "{}")
             event = {
                 "type": "async_delegation", "delegation_id": delegation_id, "session_key": session_key,
@@ -253,6 +257,17 @@ def recover_abandoned_delegations() -> int:
     return recovered
 
 
+def _recover_abandoned_with_metric() -> int:
+    """Run idempotent owner-loss recovery and retain its count in structured logs."""
+    recovered = recover_abandoned_delegations()
+    logger.info(
+        "Recovered %d abandoned async delegation(s)",
+        recovered,
+        extra={"async_delegations_recovered_total": recovered},
+    )
+    return recovered
+
+
 def restore_undelivered_completions(target_queue) -> int:
     """Enqueue durable pending completions as fresh turns after process start.
     Restored events are stamped ``restored=True`` in memory only: they came from a PREVIOUS
@@ -267,7 +282,7 @@ def restore_undelivered_completions(target_queue) -> int:
     ownership, otherwise a brand-new session adopts a dead session's delegation results seconds after boot
     (#64484).
     """
-    recover_abandoned_delegations()
+    _recover_abandoned_with_metric()
     now, restored = time.time(), 0
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at
@@ -391,6 +406,8 @@ def _event_delivery(fn, evt: Dict[str, Any], claim_id: str) -> None:
 
 
 def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
+    # Status may be the first startup touchpoint after the owner exits.
+    _recover_abandoned_with_metric()
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute("""SELECT origin_session, state, dispatched_at, completed_at,
                       result_json, delivery_state, delivery_attempts,
@@ -455,7 +472,7 @@ def _new_delegation_id() -> str:
 
 def _prune_completed_locked() -> None:
     """Drop the oldest completed records beyond the cap. Caller holds ``_records_lock``."""
-    completed = [(rid, r) for rid, r in _records.items() if r.get("status") != "running"]
+    completed = [(rid, r) for rid, r in _records.items() if r.get("status") not in _LIVE_STATES]
     completed.sort(key=lambda kv: kv[1].get("completed_at") or kv[1].get("dispatched_at") or 0)
     for rid, _ in completed[: max(0, len(completed) - _MAX_RETAINED_COMPLETED)]:
         _records.pop(rid, None)
@@ -865,6 +882,81 @@ def interrupt_all(reason: str = "shutdown") -> int:
     with _records_lock:
         targets = [r for r in _records.values() if r.get("status") in _ACTIVE_STATES]
     return _interrupt_records(targets, "interrupt_all", reason, "Interrupted %d async delegation(s) (%s)")
+
+
+def finalize_for_oneshot_shutdown(*, grace_seconds: float = 2.0) -> dict[str, int]:
+    """Signal live children, then terminalize them against one monotonic grace deadline.
+
+    Interrupt callbacks are synchronous; their elapsed time consumes the grace
+    budget. An overrun therefore skips the wait rather than renewing the budget.
+    """
+    reason = (
+        "One-shot shutdown grace period elapsed before the delegation recorded a "
+        "terminal result; outcome unknown."
+    )
+    with _records_lock:
+        target_records = [record for record in _records.values() if record.get("status") in _ACTIVE_STATES]
+        targets = [dict(record) for record in target_records]
+    target_ids = {str(record["delegation_id"]) for record in targets}
+    deadline = time.monotonic() + max(0.0, float(grace_seconds))
+    signaled = _interrupt_records(
+        targets,
+        "finalize_for_oneshot_shutdown",
+        "oneshot shutdown",
+        "Interrupted %d async delegation(s) (%s)",
+    )
+
+    while target_ids:
+        with _records_lock:
+            live = {
+                delegation_id
+                for delegation_id in target_ids
+                if (_records.get(delegation_id) or {}).get("status") in _LIVE_STATES
+            }
+        if not live:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.02, remaining))
+
+    survivors = []
+    with _records_lock:
+        for delegation_id in target_ids:
+            record = _records.get(delegation_id)
+            if record is None or record.get("status") not in _ACTIVE_STATES:
+                continue
+            record["status"] = "finalizing"
+            record["completed_at"] = time.time()
+            record["interrupt_fn"] = None
+            record["progress_fn"] = None
+            survivors.append(dict(record))
+
+    for record in survivors:
+        if record.get("is_batch"):
+            result = {
+                "results": [],
+                "error": reason,
+                "total_duration_seconds": round(record["completed_at"] - record["dispatched_at"], 2),
+            }
+        else:
+            result = {"status": "unknown", "summary": None, "error": reason}
+        _push_completion_event(record, result, "unknown")
+        with _records_lock:
+            current = _records.get(record["delegation_id"])
+            if current is not None and current.get("status") == "finalizing":
+                current["status"] = "unknown"
+            _prune_completed_locked()
+
+    with _records_lock:
+        # Completed rows can be evicted from the in-memory retention cache during
+        # this shutdown. Keep the original record references for exact totals.
+        statuses = [record.get("status") for record in target_records]
+    return {
+        "signaled": signaled,
+        "interrupted": sum(status == "interrupted" for status in statuses),
+        "unknown": sum(status == "unknown" for status in statuses),
+    }
 
 
 def interrupt_for_session(

@@ -50,6 +50,11 @@ _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call"}
 _HOOK_CALLER_THREAD_HOOKS: Set[str] = {"subagent_stop"}
 # After a timeout, suppress the same callback this long so a hung hook cannot pile up threads.
 _HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0
+# Concurrent calls for one callback are serialized through one bounded FIFO worker. Producers
+# backpressure at the cap instead of silently dropping observer callbacks.
+_HOOK_CALLBACK_QUEUE_CAP = 64
+# Let the bounded runner time out first, then make a leaked running latch recoverable.
+_HOOK_RUNNING_LATCH_GRACE_SECONDS = 5.0
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = "pre_tool_call plugin callback timed out or is still running"
 
 # System-prompt sections are tightly bounded: they become high-trust prompt bytes charged every turn.
@@ -201,25 +206,111 @@ class PluginDispatchMixin:
     def _run_hook_callback_bounded(
         self, hook_name: str, cb: Callable, kwargs: Dict[str, Any], timeout: float
     ) -> Any:
-        """Run one callback on a daemon worker with a wall-clock cap; ``_HOOK_SKIPPED`` when
-        suppressed, still running, or timed out (worker abandoned, never joined). Exceptions
-        propagate."""
+        """Queue one callback on its FIFO worker; ``_HOOK_SKIPPED`` only on a real timeout."""
         callback_name = getattr(cb, "__name__", repr(cb))
+        caller_deadline = time.monotonic() + timeout
         callback_key = (hook_name, id(cb))
-        token = object()
+        job = {
+            "callback": cb,
+            "callback_name": callback_name,
+            "context": contextvars.copy_context(),
+            "done": threading.Event(),
+            "failure": {},
+            "hook_name": hook_name,
+            "kwargs": kwargs,
+            "outcome": {},
+            "timeout": timeout,
+        }
         with self._hook_timeout_lock:
-            suppressed_until = self._hook_timeout_suppressed_until.get(callback_key)
-            running = callback_key in self._hook_running_callbacks
-            if (suppressed_until is not None and suppressed_until > time.monotonic()) or running:
-                logger.warning(
-                    "Hook '%s' callback %s skipped after previous "
-                    "timeout or while still running", hook_name, callback_name)
-                return _HOOK_SKIPPED
-            if suppressed_until is not None:
-                self._hook_timeout_suppressed_until.pop(callback_key, None)
-            self._hook_running_callbacks[callback_key] = token
+            queues = getattr(self, "_hook_callback_queues", None)
+            if queues is None:
+                queues = self._hook_callback_queues = {}
+            callback_queue = queues.get(callback_key)
+            if callback_queue is None:
+                callback_queue = queues[callback_key] = queue.Queue(
+                    maxsize=_HOOK_CALLBACK_QUEUE_CAP)
+            workers = getattr(self, "_hook_callback_workers", None)
+            if workers is None:
+                workers = self._hook_callback_workers = {}
+            worker = workers.get(callback_key)
+            if worker is None or not worker.is_alive():
+                worker = threading.Thread(
+                    target=self._drain_hook_callback_queue,
+                    args=(callback_key, callback_queue),
+                    name=f"hermes-hook-queue-{callback_name}"[:40],
+                    daemon=True,
+                )
+                workers[callback_key] = worker
+                worker.start()
+        remaining = max(0.0, caller_deadline - time.monotonic())
+        try:
+            callback_queue.put(job, timeout=remaining)
+        except queue.Full:
+            logger.warning(
+                "Hook '%s' callback %s skipped after callback FIFO remained saturated for %gs",
+                hook_name, callback_name, timeout,
+            )
+            return _HOOK_SKIPPED
+        remaining = max(0.0, caller_deadline - time.monotonic())
+        if not job["done"].wait(timeout=remaining):
+            logger.warning(
+                "Hook '%s' callback %s timed out waiting for callback FIFO completion after %gs",
+                hook_name, callback_name, timeout,
+            )
+            return _HOOK_SKIPPED
+        if "exc" in job["failure"]:
+            raise job["failure"]["exc"]
+        return job["outcome"].get("value")
 
-        context = contextvars.copy_context()
+    def _drain_hook_callback_queue(self, callback_key: tuple, callback_queue: queue.Queue) -> None:
+        """Run every admitted callback in FIFO order; the bounded queue applies backpressure."""
+        while True:
+            job = callback_queue.get()
+            try:
+                job["outcome"]["value"] = self._execute_hook_callback_bounded(
+                    job["hook_name"], callback_key, job["callback"], job["callback_name"],
+                    job["kwargs"], job["context"], job["timeout"])
+            except Exception as exc:
+                job["failure"]["exc"] = exc
+            finally:
+                job["done"].set()
+                callback_queue.task_done()
+
+    def _execute_hook_callback_bounded(
+        self, hook_name: str, callback_key: tuple, cb: Callable, callback_name: str,
+        kwargs: Dict[str, Any], context: contextvars.Context, timeout: float,
+    ) -> Any:
+        """Run the FIFO head with a wall-clock cap, waiting out a prior real timeout."""
+        token = object()
+        while True:
+            with self._hook_timeout_lock:
+                now = time.monotonic()
+                suppressed_until = self._hook_timeout_suppressed_until.get(callback_key)
+                running_entry = self._hook_running_callbacks.get(callback_key)
+                if running_entry is not None:
+                    _running_token, running_started, running_until = running_entry
+                    if running_until <= now:
+                        # citadel-hook-running-deadline-v1: a timed-out worker may never
+                        # reach its finally block. Reap its latch after timeout + grace.
+                        self._hook_running_callbacks.pop(callback_key, None)
+                        running_entry = None
+                        logger.warning(
+                            "Hook callback %s reaped expired running latch key=%r age=%.3fs",
+                            callback_name, callback_key, now - running_started)
+                if suppressed_until is not None and suppressed_until <= now:
+                    self._hook_timeout_suppressed_until.pop(callback_key, None)
+                    suppressed_until = None
+                if running_entry is None and suppressed_until is None:
+                    running_until = now + timeout + _HOOK_RUNNING_LATCH_GRACE_SECONDS
+                    self._hook_running_callbacks[callback_key] = (token, now, running_until)
+                    break
+                deadlines = [value for value in (
+                    suppressed_until,
+                    running_entry[2] if running_entry is not None else None,
+                ) if value is not None]
+                wait_seconds = max(0.001, min(deadlines) - now)
+            time.sleep(wait_seconds)
+
         done = threading.Event()
         outcome: Dict[str, Any] = {}
         failure: Dict[str, Exception] = {}
@@ -231,7 +322,8 @@ class PluginDispatchMixin:
                 failure["exc"] = exc
             finally:
                 with self._hook_timeout_lock:
-                    if self._hook_running_callbacks.get(callback_key) is token:
+                    running_entry = self._hook_running_callbacks.get(callback_key)
+                    if running_entry is not None and running_entry[0] is token:
                         self._hook_running_callbacks.pop(callback_key, None)
                 done.set()
 
@@ -243,7 +335,8 @@ class PluginDispatchMixin:
                 self._hook_timeout_suppressed_until[callback_key] = (
                     time.monotonic() + self._hook_timeout_suppression_seconds)
             logger.warning(
-                "Hook '%s' callback %s timed out after %gs — skipping", hook_name, callback_name, timeout)
+                "Hook '%s' callback %s timed out after %gs — skipping",
+                hook_name, callback_name, timeout)
             return _HOOK_SKIPPED
         if "exc" in failure:
             raise failure["exc"]
