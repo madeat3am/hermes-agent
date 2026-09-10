@@ -295,9 +295,10 @@ class PluginLedgerMixin:
         ):
             container.clear()
         self._context_engine = None
-        with self._hook_timeout_lock:
-            self._hook_running_callbacks.clear()
-            self._hook_abandoned.clear()
-            self._hook_timeout_suppressed_until.clear()
+        # Timed-out workers are abandoned without join, so a live latch, the abandoned-worker
+        # cap bookkeeping, a suppression window, or a FIFO waiter may still belong to an
+        # in-flight callback. Clearing those on unload-all lets force-reload re-register the
+        # same callback and start a duplicate worker; waiters would also hang if dropped
+        # unsignaled.
         self._hook_failures_reported.clear()
         self._discovered = False
