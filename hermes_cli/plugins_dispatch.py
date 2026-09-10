@@ -53,6 +53,8 @@ _HOOK_CALLER_THREAD_HOOKS: Set[str] = {"subagent_stop"}
 _HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0
 # Live workers a hung callback may accumulate before it is skipped outright (#105223 / #98382).
 _HOOK_MAX_ABANDONED_WORKERS = 3
+# Concurrent invocations wait in a bounded FIFO. Each admitted callback receives its own timeout.
+_HOOK_CALLBACK_QUEUE_CAP = 64
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = "pre_tool_call plugin callback timed out or is still running"
 
 
@@ -179,6 +181,12 @@ def _hook_uses_callback_timeout(hook_name: str, timeout: float) -> bool:
 
 
 class PluginDispatchMixin:
+    _hook_timeout_lock: Any
+    _hook_callback_waiters: Dict[tuple, List[threading.Event]]
+    _hook_running_callbacks: Dict[tuple, object]
+    _hook_timeout_suppressed_until: Dict[tuple, float]
+    _hook_timeout_suppression_seconds: float
+
     @staticmethod
     def _hook_callback_kwargs(callback: Callable, payload: Dict[str, Any]) -> Dict[str, Any]:
         """The slice of *payload* a callback accepts: everything for ``**kwargs`` (or
@@ -270,89 +278,123 @@ class PluginDispatchMixin:
         self, hook_name: str, cb: Callable, kwargs: Dict[str, Any], timeout: float
     ) -> Any:
         """Run one callback on a daemon worker with a wall-clock cap; ``_HOOK_SKIPPED`` when
-        suppressed, still running for this call id, over the abandoned-worker cap, timed out
-        (worker abandoned, never joined), or the worker could not be started. Exceptions
-        propagate."""
+        suppressed, still running for this call id, over the abandoned-worker cap, its FIFO
+        queue is full, timed out (worker abandoned, never joined), or the worker could not be
+        started. Exceptions propagate.
+
+        Concurrent calls to the same callback are admitted one at a time in arrival (FIFO)
+        order (queue bounded by ``_HOOK_CALLBACK_QUEUE_CAP``) so hook delivery stays ordered
+        even when several calls race — the research-rigor finalizer depends on ordered hook
+        delivery ("tool evidence lost under hook contention" is a known past defect).
+        """
         callback_name = getattr(cb, "__name__", repr(cb))
         # Suppression is a fact about the CALLBACK — a hung one must keep its back-off —
         # so that key stays coarse. The gate must instead tell CONCURRENT CALLS apart.
         suppression_key = (hook_name, id(cb))
         gate_key = (*suppression_key, _hook_call_identity(kwargs))
-        token = object()
+
+        waiter = threading.Event()
         with self._hook_timeout_lock:
-            suppressed_until = self._hook_timeout_suppressed_until.get(suppression_key)
-            if (gate_key in self._hook_running_callbacks
-                    or (suppressed_until is not None and suppressed_until > time.monotonic())):
+            waiters = self._hook_callback_waiters.setdefault(suppression_key, [])
+            if len(waiters) >= _HOOK_CALLBACK_QUEUE_CAP:
                 logger.warning(
-                    "Hook '%s' callback %s skipped after previous "
-                    "timeout or while still running", hook_name, callback_name)
+                    "Hook '%s' callback %s skipped because its FIFO reached the cap of %d",
+                    hook_name, callback_name, _HOOK_CALLBACK_QUEUE_CAP,
+                )
                 return _HOOK_SKIPPED
-            # Workers abandoned on timeout still hold threads. Once the suppression window has
-            # passed, a fresh call id may start a new worker (a hung guard must not fail every
-            # later tool call closed until restart, #105223), but only up to a small cap per
-            # callback — expiring the bookkeeping while the hung worker lives must not leak a
-            # thread per call (#98382). At the cap the callback keeps being skipped (fail-closed
-            # for pre_tool_call) until one of its workers finishes and releases its slot.
-            abandoned = self._hook_abandoned.get(suppression_key)
-            if abandoned and len(abandoned) >= _HOOK_MAX_ABANDONED_WORKERS:
-                logger.warning(
-                    "Hook '%s' callback %s (%s) skipped: %d abandoned worker(s) still running — "
-                    "the plugin is hung; fix or disable it (retried when a worker finishes)",
-                    hook_name, callback_name, getattr(cb, "__module__", "unknown plugin"), len(abandoned))
-                return _HOOK_SKIPPED
-            if suppressed_until is not None:
-                self._hook_timeout_suppressed_until.pop(suppression_key, None)
-            self._hook_running_callbacks[gate_key] = token
-
-        context = contextvars.copy_context()
-        done = threading.Event()
-        outcome: Dict[str, Any] = {}
-        failure: Dict[str, BaseException] = {}
-
-        def _release_token() -> None:
-            with self._hook_timeout_lock:
-                if self._hook_running_callbacks.get(gate_key) is token:
-                    self._hook_running_callbacks.pop(gate_key, None)
-                    abandoned = self._hook_abandoned.get(suppression_key)
-                    if abandoned is not None:
-                        abandoned.discard(gate_key)
-                        if not abandoned:
-                            self._hook_abandoned.pop(suppression_key, None)
-
-        def _runner() -> None:
-            try:
-                outcome["value"] = context.run(self._invoke_hook_callback, cb, kwargs)
-            except BaseException as exc:
-                failure["exc"] = exc
-            finally:
-                _release_token()
-                done.set()
-
-        thread = threading.Thread(target=_runner, name=f"hermes-hook-{callback_name}"[:40], daemon=True)
+            waiters.append(waiter)
+            if len(waiters) == 1:
+                waiter.set()
+        # Every predecessor has its own bounded callback timeout. Queue admission is capped, so
+        # this wait is bounded without consuming the execution budget of this callback.
+        waiter.wait()
         try:
-            thread.start()
-        except RuntimeError as exc:
-            _release_token()  # the runner's finally never runs when OS thread creation fails
-            logger.warning(
-                "Hook '%s' callback %s worker failed to start: %s — skipping",
-                hook_name, callback_name, exc)
-            return _HOOK_SKIPPED
-        if not done.wait(timeout=timeout):  # do not join — that would reintroduce the hang
+            token = object()
             with self._hook_timeout_lock:
-                # See #6622.
-                self._hook_timeout_suppressed_until[suppression_key] = (
-                    time.monotonic() + self._hook_timeout_suppression_seconds)
-                # The worker may have finished (and released its token) between the wait
-                # expiring and this lock; recording it as abandoned then would block the
-                # callback for that call id until reload with no thread behind it.
-                if self._hook_running_callbacks.get(gate_key) is token:
-                    self._hook_abandoned.setdefault(suppression_key, set()).add(gate_key)
-            logger.warning(
-                "Hook '%s' callback %s timed out after %gs — skipping", hook_name, callback_name, timeout)
-            return _HOOK_SKIPPED
-        if "exc" in failure:
-            raise failure["exc"]
-        return outcome.get("value")
+                suppressed_until = self._hook_timeout_suppressed_until.get(suppression_key)
+                if (gate_key in self._hook_running_callbacks
+                        or (suppressed_until is not None and suppressed_until > time.monotonic())):
+                    logger.warning(
+                        "Hook '%s' callback %s skipped after previous "
+                        "timeout or while still running", hook_name, callback_name)
+                    return _HOOK_SKIPPED
+                # Workers abandoned on timeout still hold threads. Once the suppression window has
+                # passed, a fresh call id may start a new worker (a hung guard must not fail every
+                # later tool call closed until restart, #105223), but only up to a small cap per
+                # callback — expiring the bookkeeping while the hung worker lives must not leak a
+                # thread per call (#98382). At the cap the callback keeps being skipped (fail-closed
+                # for pre_tool_call) until one of its workers finishes and releases its slot.
+                abandoned = self._hook_abandoned.get(suppression_key)
+                if abandoned and len(abandoned) >= _HOOK_MAX_ABANDONED_WORKERS:
+                    logger.warning(
+                        "Hook '%s' callback %s (%s) skipped: %d abandoned worker(s) still running — "
+                        "the plugin is hung; fix or disable it (retried when a worker finishes)",
+                        hook_name, callback_name, getattr(cb, "__module__", "unknown plugin"), len(abandoned))
+                    return _HOOK_SKIPPED
+                if suppressed_until is not None:
+                    self._hook_timeout_suppressed_until.pop(suppression_key, None)
+                self._hook_running_callbacks[gate_key] = token
+
+            context = contextvars.copy_context()
+            done = threading.Event()
+            outcome: Dict[str, Any] = {}
+            failure: Dict[str, BaseException] = {}
+
+            def _release_token() -> None:
+                with self._hook_timeout_lock:
+                    if self._hook_running_callbacks.get(gate_key) is token:
+                        self._hook_running_callbacks.pop(gate_key, None)
+                        abandoned = self._hook_abandoned.get(suppression_key)
+                        if abandoned is not None:
+                            abandoned.discard(gate_key)
+                            if not abandoned:
+                                self._hook_abandoned.pop(suppression_key, None)
+
+            def _runner() -> None:
+                try:
+                    outcome["value"] = context.run(self._invoke_hook_callback, cb, kwargs)
+                except BaseException as exc:
+                    failure["exc"] = exc
+                finally:
+                    _release_token()
+                    done.set()
+
+            thread = threading.Thread(target=_runner, name=f"hermes-hook-{callback_name}"[:40], daemon=True)
+            try:
+                thread.start()
+            except RuntimeError as exc:
+                _release_token()  # the runner's finally never runs when OS thread creation fails
+                logger.warning(
+                    "Hook '%s' callback %s worker failed to start: %s — skipping",
+                    hook_name, callback_name, exc)
+                return _HOOK_SKIPPED
+            if not done.wait(timeout=timeout):  # do not join — that would reintroduce the hang
+                with self._hook_timeout_lock:
+                    # See #6622.
+                    self._hook_timeout_suppressed_until[suppression_key] = (
+                        time.monotonic() + self._hook_timeout_suppression_seconds)
+                    # The worker may have finished (and released its token) between the wait
+                    # expiring and this lock; recording it as abandoned then would block the
+                    # callback for that call id until reload with no thread behind it.
+                    if self._hook_running_callbacks.get(gate_key) is token:
+                        self._hook_abandoned.setdefault(suppression_key, set()).add(gate_key)
+                logger.warning(
+                    "Hook '%s' callback %s timed out after %gs — skipping", hook_name, callback_name, timeout)
+                return _HOOK_SKIPPED
+            if "exc" in failure:
+                raise failure["exc"]
+            return outcome.get("value")
+        finally:
+            with self._hook_timeout_lock:
+                waiters = self._hook_callback_waiters.get(suppression_key, [])
+                if waiters and waiters[0] is waiter:
+                    waiters.pop(0)
+                elif waiter in waiters:
+                    waiters.remove(waiter)
+                if waiters:
+                    waiters[0].set()
+                else:
+                    self._hook_callback_waiters.pop(suppression_key, None)
 
     def _subscribe_event(self, owner: str, event: str, callback: Callable) -> None:
         """Add an owner-tagged event subscription in registration order."""
