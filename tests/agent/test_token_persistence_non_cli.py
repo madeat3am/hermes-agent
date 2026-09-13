@@ -2,6 +2,9 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 import json
 import sys
+from pathlib import Path
+
+import pytest
 
 from run_agent import AIAgent
 
@@ -88,3 +91,111 @@ def test_session_search_lazily_opens_db_when_entrypoint_did_not_pass_one(monkeyp
     assert captured["query"] == "Hermes"
     assert captured["detail"] == "full"
     assert agent._session_db is sentinel_db
+
+
+def test_sequential_session_search_forwards_detail(monkeypatch):
+    session_db = MagicMock()
+    captured = {}
+
+    session_search_mod = ModuleType("tools.session_search_tool")
+
+    def fake_session_search(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"success": True, "results": []})
+
+    session_search_mod.session_search = fake_session_search
+    monkeypatch.setitem(sys.modules, "tools.session_search_tool", session_search_mod)
+
+    agent = _make_agent(session_db, platform="acp")
+    tool_call = SimpleNamespace(
+        id="search-1",
+        function=SimpleNamespace(
+            name="session_search",
+            arguments=json.dumps({"query": "Hermes", "detail": "full"}),
+        ),
+    )
+    assistant_message = SimpleNamespace(tool_calls=[tool_call])
+    messages = []
+
+    agent._execute_tool_calls_sequential(
+        assistant_message,
+        messages,
+        "task-id",
+    )
+
+    assert captured["db"] is session_db
+    assert captured["query"] == "Hermes"
+    assert captured["detail"] == "full"
+
+
+@pytest.mark.parametrize("execution_path", ["inline", "sequential"])
+@pytest.mark.parametrize("profile", ["llm-wiki", "missing-profile", "default", None])
+@pytest.mark.parametrize("active_profile", ["default", "llm-wiki"])
+def test_session_search_uses_requested_profile_database(
+    monkeypatch, tmp_path, execution_path, profile, active_profile
+):
+    """Both public dispatch paths honor explicit profiles without falling back."""
+    from hermes_state import SessionDB
+
+    hermes_home = tmp_path / ".hermes"
+    profile_home = hermes_home / "profiles" / "llm-wiki"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    current_db = SessionDB(hermes_home / "state.db")
+    current_db.create_session("default-session", source="gateway")
+    current_db.append_message(
+        "default-session", role="user", content="weekly report default"
+    )
+    current_db._conn.commit()
+
+    profile_db = SessionDB(profile_home / "state.db")
+    profile_db.create_session("profile-session", source="cli")
+    profile_db.append_message(
+        "profile-session", role="user", content="weekly report llm wiki"
+    )
+    profile_db._conn.commit()
+    profile_db.close()
+
+    if active_profile == "llm-wiki":
+        current_db.close()
+        current_db = SessionDB(profile_home / "state.db")
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    agent = _make_agent(current_db, platform="acp")
+    tool_args = {"query": "weekly report", "profile": profile}
+
+    try:
+        if execution_path == "inline":
+            raw_result = agent._invoke_tool("session_search", tool_args, "task-id")
+        else:
+            tool_call = SimpleNamespace(
+                id="session-search-1",
+                function=SimpleNamespace(
+                    name="session_search", arguments=json.dumps(tool_args)
+                ),
+            )
+            messages = []
+            agent._execute_tool_calls_sequential(
+                SimpleNamespace(tool_calls=[tool_call]), messages, "task-id"
+            )
+            raw_result = messages[-1]["content"]
+    finally:
+        current_db.close()
+
+    result = json.loads(raw_result)
+    if profile == "missing-profile":
+        assert result["success"] is False
+        assert "profile 'missing-profile' does not exist" in result["error"]
+        assert not result.get("results")
+        assert "default-session" not in raw_result
+        assert not (hermes_home / "profiles" / "missing-profile").exists()
+        return
+
+    assert result["success"] is True
+    selected = profile or active_profile
+    expected_session = "profile-session" if selected == "llm-wiki" else "default-session"
+    assert [entry["session_id"] for entry in result["results"]] == [expected_session]
+    if profile == "llm-wiki":
+        assert result["results"][0]["link"] == "@session:llm-wiki/profile-session"
