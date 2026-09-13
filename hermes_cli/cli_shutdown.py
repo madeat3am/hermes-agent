@@ -318,6 +318,6 @@ def _finalize_single_query(cli) -> None:
             except Exception:
                 logger.debug("one-shot %s failed", what, exc_info=True)
         _notify_single_query_session_finalize(cli)
-        _run_cleanup(notify_session_finalize=False)
+        _run_cleanup(notify_session_finalize=False, single_query=True)
     finally:
         cli._release_active_session()

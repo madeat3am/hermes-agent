@@ -495,7 +495,7 @@ def _arm_exit_watchdog_on_shutdown_signal() -> None:
         _arm_exit_watchdog(timeout_s=base * 2, from_signal=True)
 
 
-def _run_cleanup(*, notify_session_finalize: bool = True):
+def _run_cleanup(*, notify_session_finalize: bool = True, single_query: bool = False):
     """Run resource cleanup exactly once."""
     global _cleanup_done, _cleanup_in_progress
     if _cleanup_done:
@@ -512,7 +512,11 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
 
         for step, swallow in _CLEANUP_STEPS:
             with suppress(swallow):
-                globals()[step]()
+                if single_query and step == "_interrupt_async_delegations":
+                    from tools.async_delegation import finalize_for_oneshot_shutdown
+                    finalize_for_oneshot_shutdown()
+                else:
+                    globals()[step]()
         if notify_session_finalize:
             cleanup_session_id = _active_agent_ref.session_id if _active_agent_ref else None
             if _should_emit_cleanup_session_finalize(cleanup_session_id):
