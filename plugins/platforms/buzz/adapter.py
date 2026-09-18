@@ -271,6 +271,13 @@ _WS_AUTH_TIMEOUT = 20.0
 # close the transport never surfaces (observed as a CLOSE_WAIT socket with the loop parked on recv, #98097)
 # leaves the gateway "connected" while inbound stops; this timeout forces the normal reconnect path instead.
 _WS_READ_IDLE_TIMEOUT = 300.0
+# Frame-aware watchdog: the read side is sliced into liveness windows and a connection is only declared
+# dead once its keepalive liveness also stops changing.  ``websockets`` answers ping/pong frames inside
+# the library and never surfaces them as data frames, so the raw data-frame watch must not be confused
+# with connection liveness — a quiet relay answers pings for hours (#2026-hermes-u7, scout-buzz section 3).
+_WS_LIVENESS_SLICE = 60.0          # max seconds between liveness re-checks of the data stream
+_WS_LIVENESS_STALL_LIMIT = 2       # consecutive slices with no liveness change before declaring dead
+_WS_PONG_SAMPLE_UNSET = object()   # sentinel: no liveness sample seen yet
 _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100  # Buzz channel-membership event — live DM discovery
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
@@ -667,10 +674,10 @@ class BuzzAdapter(BasePlatformAdapter):
         self._ws_ready: Optional[asyncio.Event] = None
         self._membership_since = self._poll_count = 0
         self._lock_key: Optional[str] = None
-        # Channels the relay permanently rejected ("restricted"); persists across reconnects so we never re-subscribe.
-        # channel_id -> { "chat_type", "last_ts", "seen": OrderedDict[event_id, None], "event_meta":
-        # OrderedDict[event_id, (author_pubkey, content_snippet)], } event_meta backs NIP-10 reply-parent
-        # resolution for require_mention (thread replies to our own messages count as addressed — #75826).
+        # Channels the relay permanently rejected ("restricted"); persists across reconnects *and*
+        # restarts (durable copy in the channel-cursor file via _load_cursors/_save_cursors), so a
+        # restart no longer re-seeds rejected channels and reconnect-loops.  Re-granted access is
+        # restored by removing the channel id from the cursor file's "restricted" list.
         # "restricted: not a channel member").
         self._restricted_channels: set = set()
         # channel_id -> {"chat_type", "last_ts", "seen": OrderedDict[event_id, None], "event_meta":
@@ -793,7 +800,7 @@ class BuzzAdapter(BasePlatformAdapter):
         self._load_cursors()
         for channel_id in watch:
             if channel_id in self._restricted_channels:
-                logger.debug("Buzz: skipping restricted channel %s (relay rejected subscription)", channel_id)
+                logger.info("Buzz: skipping restricted channel %s (relay rejected subscription)", channel_id)
                 continue
             await self._seed_channel(channel_id, chat_type="group")
         await self._discover_dms(seed=True)
@@ -996,7 +1003,7 @@ class BuzzAdapter(BasePlatformAdapter):
         # The event id IS the dispatched message_id; channel is not a parameter here.
         code, _out, err = await self._run_cli(["reactions", "add", "--event", str(message_id), "--emoji", emoji])
         if code != 0:
-            logger.debug("Buzz: reaction add failed for message %s in %s — %s", message_id[:12], chat_id, _cli_error_message(err, code))
+            logger.info("Buzz: reaction add failed for message %s in %s — %s", message_id[:12], chat_id, _cli_error_message(err, code))
         return code == 0
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
@@ -1262,16 +1269,54 @@ class BuzzAdapter(BasePlatformAdapter):
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
 
+    @staticmethod
+    def _websocket_pong_latency(websocket) -> Optional[float]:
+        """Latest keepalive round-trip the library recorded, when observable.
+
+        ``websockets`` Connection objects expose ``latency`` after every answered ping; a falsy or
+        unavailable sample counts as "no liveness progress" so the watchdog still recovers transports
+        that cannot be observed.
+        """
+        latency = getattr(websocket, "latency", None)
+        if latency is None:
+            return None
+        try:
+            return float(latency)
+        except (TypeError, ValueError):
+            return None
+
     async def _ws_read_loop(self, websocket, subscriptions: Dict[str, Optional[str]]) -> None:
-        """Read frames until the relay closes; an idle read raises ConnectionError to reconnect."""
+        """Read frames until the relay closes; a liveness-stalled read raises ConnectionError to reconnect.
+
+        Frame-aware: data frames (EVENT / CLOSED / NOTICE) prove activity directly, but an otherwise
+        healthy relay can stay silent for minutes while its library keepalive keeps succeeding.  The
+        deadline is therefore not a single idle read bound: each liveness slice checks whether the
+        connection's keepalive round-trip is still changing — only a connection with no liveness
+        progress for ``_WS_LIVENESS_STALL_LIMIT`` consecutive slices is declared dead (#98097,
+        scout-buzz section 3: 2199 of 2301 disconnects were quiet-healthy relays at a fixed 301s cadence).
+        """
         frame_iter = websocket.__aiter__()
+        previous_pong: object = _WS_PONG_SAMPLE_UNSET
+        pong_stall = 0
+        slice_timeout = min(_WS_LIVENESS_SLICE, max(_WS_READ_IDLE_TIMEOUT, 0.05))
         while True:
             try:
-                raw = await asyncio.wait_for(frame_iter.__anext__(), timeout=_WS_READ_IDLE_TIMEOUT)
+                raw = await asyncio.wait_for(frame_iter.__anext__(), timeout=slice_timeout)
             except StopAsyncIteration:
                 return
             except asyncio.TimeoutError:
-                raise ConnectionError(f"no WebSocket frame for {_WS_READ_IDLE_TIMEOUT:.0f}s; assuming the connection went silent") from None
+                current = self._websocket_pong_latency(websocket)
+                if current is not None and current != previous_pong:
+                    # Keepalive progress: the relay (or transport) is answering pings — healthy silence.
+                    previous_pong, pong_stall = current, 0
+                    continue
+                pong_stall += 1
+                if pong_stall >= _WS_LIVENESS_STALL_LIMIT:
+                    raise ConnectionError(
+                        f"no WebSocket frame or keepalive progress for ~{slice_timeout * pong_stall:.0f}s"
+                        f" (idle budget {_WS_READ_IDLE_TIMEOUT:.0f}s); assuming the connection went silent"
+                    ) from None
+                continue
             try:
                 message = json.loads(raw)
             except (ValueError, TypeError):
@@ -1345,7 +1390,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 return
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
-            logger.debug("Buzz: could not read channel cursors", exc_info=True)
+            logger.warning("Buzz: could not read channel cursors", exc_info=True)
             return
         if not isinstance(data, dict) or data.get("identity") != self._self_pubkey or data.get("relay") != self.relay_url:
             return
@@ -1361,6 +1406,11 @@ class BuzzAdapter(BasePlatformAdapter):
             raw_seen = entry.get("seen")
             seen = [str(event_id) for event_id in raw_seen][-_SEEN_CAP:] if isinstance(raw_seen, list) else []
             self._restored_cursors[str(channel_id)] = {"chat_type": str(entry.get("chat_type") or ""), "last_ts": last_ts, "seen": seen}
+        # Durably restore permanently-rejected ("restricted") channels so a restart does not re-seed
+        # them and reconnect-loop; re-granted access requires clearing the entry from the cursor file.
+        raw_restricted = data.get("restricted")
+        if isinstance(raw_restricted, (list, set)):
+            self._restricted_channels.update(str(channel_id) for channel_id in raw_restricted)
 
     def _save_cursors(self) -> None:
         """Persist every watched channel's cursor.  Never raises."""
@@ -1371,12 +1421,16 @@ class BuzzAdapter(BasePlatformAdapter):
             }
             for channel_id, state in self._channel_state.items()
         }
-        payload = {"identity": self._self_pubkey, "relay": self.relay_url, "channels": channels}
+        payload = {
+            "identity": self._self_pubkey, "relay": self.relay_url,
+            "restricted": sorted(self._restricted_channels),
+            "channels": channels,
+        }
         try:
             from utils import atomic_json_write
             atomic_json_write(self._cursor_path(), payload, indent=None)
         except Exception:
-            logger.debug("Buzz: could not persist channel cursors", exc_info=True)
+            logger.warning("Buzz: could not persist channel cursors", exc_info=True)
 
     @staticmethod
     def _cursor_mark(state: dict) -> tuple:
@@ -1478,7 +1532,7 @@ class BuzzAdapter(BasePlatformAdapter):
             args += ["--since", str(state["last_ts"])]
         code, out, err = await self._run_cli(args)
         if code != 0:
-            logger.debug("Buzz: poll of channel %s failed — %s", channel_id, _cli_error_message(err, code))
+            logger.info("Buzz: poll of channel %s failed — %s", channel_id, _cli_error_message(err, code))
             return
         await self._handle_events(channel_id, state, _parse_json_list(out))
 
@@ -1626,7 +1680,7 @@ class BuzzAdapter(BasePlatformAdapter):
         if self._allowed_pubkeys and pubkey not in self._allowed_pubkeys:
             if pubkey in self._reaction_only_pubkeys and _p_tagged(event, self._self_pubkey) and self._is_mentioned(content):
                 await self.send_reaction(channel_id, event_id, "👀")
-            logger.debug("Buzz: ignoring message from unauthorized pubkey %s…", pubkey[:8])
+            logger.warning("Buzz: ignoring message from unauthorized pubkey %s…", pubkey[:8])
             return
         # Strip a leading @mention (DMs often open with one too) so "@Chip /whoami" is recognized as a command.
         dispatch_text = self._strip_mention(content)
@@ -1908,7 +1962,7 @@ class BuzzAdapter(BasePlatformAdapter):
         try:
             await self.send_reaction(chat_id, message_id, "👀")
         except Exception:
-            logger.debug("Buzz: reaction failed for message %s", message_id[:12], exc_info=True)
+            logger.warning("Buzz: reaction failed for message %s", message_id[:12], exc_info=True)
 
 
 # ── Plugin registration ──────────────────────────────────────────────────────

@@ -961,7 +961,8 @@ def _warm_turn_machinery_sync() -> int:
     try:
         from agent.prompt_builder import build_context_files_prompt
 
-        build_context_files_prompt()
+        context_length = _resolve_gateway_model_context().context_length
+        build_context_files_prompt(context_length=context_length)
     except Exception:
         logger.debug("context-file warm-up failed (non-fatal)", exc_info=True)
     from hermes_cli.config import load_config_readonly

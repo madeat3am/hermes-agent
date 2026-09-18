@@ -680,3 +680,108 @@ async def test_ws_discovery_task_cancelled_when_connection_exits(monkeypatch):
 
     assert started, "discovery task was never started with the connection"
     assert all(t.done() for t in started), "discovery task outlived its connection"
+
+
+# ── Frame-aware watchdog (#98097 + 2026-hermes-u7) ──────────────────────────
+
+
+class _LivenessWebSocket(_ScriptedWebSocket):
+    """A relay whose keepalive round-trips the library exposes via ``latency``.
+
+    ``changing=True`` models a healthy quiet relay: every successive keepalive
+    sample differs because a pong was answered. ``changing=False`` models a
+    genuinely dead connection: the last measured round-trip stops changing.
+    """
+
+    def __init__(self, anext_behavior, *, changing):
+        self._latency_value = 1.0
+        self._changing = changing
+        super().__init__(anext_behavior)
+
+    @property
+    def latency(self):
+        if self._changing:
+            self._latency_value += 1.0
+        return self._latency_value
+
+
+@pytest.mark.asyncio
+async def test_websocket_loop_holds_quiet_relay_beyond_idle_budget(monkeypatch):
+    """A quiet-but-healthy relay (pings answered, zero data frames) must stay connected.
+
+    The pre-fix watchdog applied a single 300s timeout to the data-frame stream, so every quiet
+    stretch over 300s forced a reconnect (2199 of 2301 disconnects at an exact 301s cadence). Here
+    the idle budget is scaled down to 0.4s-equivalent: the loop must hold well past several
+    multiples of that budget with zero data frames, as long as keepalive liveness keeps changing.
+    """
+    adapter = _make_adapter()
+    monkeypatch.setattr(_buzz_mod, "_WS_READ_IDLE_TIMEOUT", 0.4)
+
+    sockets = []
+
+    async def silent_anext():
+        await asyncio.Event().wait()  # a quiet relay yields no data frames at all
+
+    def fake_connect(*args, **kwargs):
+        ws = _LivenessWebSocket(silent_anext, changing=True)
+        sockets.append(ws)
+        return ws
+
+    import websockets as _ws_mod
+
+    monkeypatch.setattr(_ws_mod, "connect", fake_connect)
+
+    task = asyncio.create_task(adapter._websocket_loop())
+    try:
+        # Four times the single-idle-read budget with no data frames: under the old watchdog this
+        # would have reconnected within *one* budget slot.
+        await asyncio.sleep(1.6)
+        assert len(sockets) == 1, (
+            "quiet relay with answered keepalive pings must not be disconnected"
+        )
+        assert not sockets[0].exited
+    finally:
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, 5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_websocket_loop_recovers_dead_connection(monkeypatch, caplog):
+    """A genuinely dead connection (keepalive liveness frozen) is still detected and recovered."""
+    import logging
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(_buzz_mod, "_WS_READ_IDLE_TIMEOUT", 0.05)
+    caplog.set_level(logging.WARNING)
+
+    sockets = []
+
+    async def dead_anext():
+        await asyncio.Event().wait()  # never yields, never raises
+
+    def fake_connect(*args, **kwargs):
+        ws = _LivenessWebSocket(dead_anext, changing=False)
+        sockets.append(ws)
+        return ws
+
+    import websockets as _ws_mod
+
+    monkeypatch.setattr(_ws_mod, "connect", fake_connect)
+
+    task = asyncio.create_task(adapter._websocket_loop())
+    try:
+        deadline = time.monotonic() + 5.0
+        while len(sockets) < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        assert len(sockets) >= 2, "frozen keepalive liveness did not force a reconnect"
+        assert sockets[0].exited
+        assert any("went silent" in record.message for record in caplog.records)
+    finally:
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, 5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
