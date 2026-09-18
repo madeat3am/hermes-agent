@@ -3358,6 +3358,79 @@ class TestBuzzAdapterEdit:
         assert len(result["error"]) <= 1024
         assert "success" not in result
         assert "media_delivered" not in result
+# ── Restricted-channel durability across restart (2026-hermes-u7) ──────────
+
+
+class TestRestrictedChannelPersistence:
+    """Channels the relay permanently rejected survive a restart.
+
+    Pre-fix behaviour: _restricted_channels was in-memory only, so a restart
+    wiped it, connect() re-seeded every config-listed channel, and the relay
+    re-rejected the dead ones — the 9-16/9-18 control-channel loop. Re-granted
+    access is restored by removing the channel id from the cursor file.
+    """
+
+    @pytest.fixture
+    def adapter(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        a = _make_adapter()
+        a._message_handler = AsyncMock()
+        return a
+
+    @staticmethod
+    def _cursor_file(tmp_path):
+        return tmp_path / "buzz" / "channel-cursors.json"
+
+    @pytest.mark.asyncio
+    async def test_save_persists_restricted_channels(self, adapter, tmp_path):
+        adapter._restricted_channels.add(CHANNEL)
+        adapter._save_cursors()
+
+        saved = json.loads(self._cursor_file(tmp_path).read_text(encoding="utf-8"))
+        assert saved["restricted"] == [CHANNEL]
+
+    @pytest.mark.asyncio
+    async def test_restart_restores_restricted_channels(self, adapter, tmp_path):
+        path = self._cursor_file(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({
+                "identity": SELF_PUBKEY,
+                "relay": "https://test.relay",
+                "restricted": [CHANNEL, OTHER_PUBKEY],
+                "channels": {},
+            }),
+            encoding="utf-8",
+        )
+        restarted = _make_adapter()
+        restarted._load_cursors()
+        assert restarted._restricted_channels == {CHANNEL, OTHER_PUBKEY}
+
+    @pytest.mark.asyncio
+    async def test_restricted_restore_respects_identity_and_relay(self, adapter, tmp_path):
+        path = self._cursor_file(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({
+                "identity": OTHER_PUBKEY,
+                "relay": "https://test.relay",
+                "restricted": [CHANNEL],
+                "channels": {},
+            }),
+            encoding="utf-8",
+        )
+        # Cursor file belongs to OTHER's identity; this adapter is SELF — nothing may be adopted.
+        elsewhere = _make_adapter()
+        elsewhere._load_cursors()
+        assert elsewhere._restricted_channels == set()
+
+
+        # Relay mismatch is equally disqualifying.
+        relocated = _make_adapter({"relay_url": "https://other.relay"})
+        relocated._load_cursors()
+        assert relocated._restricted_channels == set()
+
+
 # ── Durable channel cursors across restart (#90464) ───────────────────────
 
 class TestChannelCursorPersistence:
@@ -3510,3 +3583,66 @@ class TestChannelCursorPersistence:
         saved = json.loads(self._cursor_file(tmp_path).read_text(encoding="utf-8"))
         assert saved["channels"][CHANNEL]["last_ts"] == 200
         assert saved["channels"][CHANNEL]["seen"] == ["e1", "e2"]
+
+
+# ── Denial / poll-failure visibility (2026-hermes-u7) ───────────────────────
+
+
+class TestDenialAndPollLogging:
+    """Previously-silent drops must log at INFO or above so they appear in the gateway log.
+
+    The old log had 0 DEBUG lines in 5922: allowlist denials, cursor IO errors and poll
+    failures were logged at DEBUG and therefore invisible to operators.
+    """
+
+    @pytest.fixture
+    def adapter(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        a = _make_adapter()
+        a._message_handler = AsyncMock()
+        return a
+
+    @pytest.mark.asyncio
+    async def test_poll_failure_logs_at_info_or_above(self, adapter, caplog):
+        import logging
+
+        caplog.set_level(logging.INFO)
+        async def failing_cli(args):
+            return (4, "", "buzz: no such channel")
+        adapter._run_cli = failing_cli
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "group", "last_ts": 0, "seen": {}, "event_meta": {},
+        }
+        await adapter._poll_channel(CHANNEL)
+        records = [r for r in caplog.records if "poll of channel" in r.getMessage()]
+        assert records and records[0].levelno >= logging.INFO
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_pubkey_logs_warning(self, adapter, caplog):
+        import logging
+
+        caplog.set_level(logging.INFO)
+        adapter._allowed_pubkeys = {SELF_PUBKEY}
+        adapter.require_mention = False
+        state = {
+            "chat_type": "group", "last_ts": 0, "seen": {}, "event_meta": {},
+        }
+        event = {
+            "id": "f" * 64, "kind": 9, "pubkey": OTHER_PUBKEY,
+            "content": "hi", "created_at": 100,
+        }
+        await adapter._handle_event(CHANNEL, state, event)
+        records = [r for r in caplog.records if "unauthorized pubkey" in r.getMessage()]
+        assert records and records[0].levelno >= logging.INFO
+
+    @pytest.mark.asyncio
+    async def test_cursor_io_failure_logs_warning(self, adapter, tmp_path, caplog):
+        import logging
+
+        caplog.set_level(logging.INFO)
+        path = tmp_path / "buzz" / "channel-cursors.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{ not json", encoding="utf-8")
+        adapter._load_cursors()
+        records = [r for r in caplog.records if "could not read channel cursors" in r.getMessage()]
+        assert records and records[0].levelno >= logging.INFO
