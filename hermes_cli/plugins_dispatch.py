@@ -288,8 +288,12 @@ class PluginDispatchMixin:
         delivery ("tool evidence lost under hook contention" is a known past defect).
         """
         callback_name = getattr(cb, "__name__", repr(cb))
-        # Suppression is a fact about the CALLBACK — a hung one must keep its back-off —
-        # so that key stays coarse. The gate must instead tell CONCURRENT CALLS apart.
+        # The FIFO queue is a fact about the CALLBACK (ordered delivery across concurrent
+        # calls), so that key stays coarse. But post-timeout suppression is a fact about the
+        # CALL — a hung call must not silently swallow a later, distinct call to the same
+        # callback (a research finalizer's post_tool_call evidence would be lost). So the
+        # suppression window and the running/abandoned bookkeeping are keyed on the call
+        # identity (``gate_key``), not the whole callback (carried; replaces cluster patch 0003).
         suppression_key = (hook_name, id(cb))
         gate_key = (*suppression_key, _hook_call_identity(kwargs))
 
@@ -311,7 +315,7 @@ class PluginDispatchMixin:
         try:
             token = object()
             with self._hook_timeout_lock:
-                suppressed_until = self._hook_timeout_suppressed_until.get(suppression_key)
+                suppressed_until = self._hook_timeout_suppressed_until.get(gate_key)
                 if (gate_key in self._hook_running_callbacks
                         or (suppressed_until is not None and suppressed_until > time.monotonic())):
                     logger.warning(
@@ -332,7 +336,7 @@ class PluginDispatchMixin:
                         hook_name, callback_name, getattr(cb, "__module__", "unknown plugin"), len(abandoned))
                     return _HOOK_SKIPPED
                 if suppressed_until is not None:
-                    self._hook_timeout_suppressed_until.pop(suppression_key, None)
+                    self._hook_timeout_suppressed_until.pop(gate_key, None)
                 self._hook_running_callbacks[gate_key] = token
 
             context = contextvars.copy_context()
@@ -370,8 +374,10 @@ class PluginDispatchMixin:
                 return _HOOK_SKIPPED
             if not done.wait(timeout=timeout):  # do not join — that would reintroduce the hang
                 with self._hook_timeout_lock:
-                    # See #6622.
-                    self._hook_timeout_suppressed_until[suppression_key] = (
+                    # See #6622. Keyed on gate_key (call identity), not suppression_key (whole
+                    # callback): a hung call must not also suppress a later, distinct call to
+                    # the same callback (carried; replaces cluster patch 0003).
+                    self._hook_timeout_suppressed_until[gate_key] = (
                         time.monotonic() + self._hook_timeout_suppression_seconds)
                     # The worker may have finished (and released its token) between the wait
                     # expiring and this lock; recording it as abandoned then would block the

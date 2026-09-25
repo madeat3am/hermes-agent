@@ -1536,6 +1536,47 @@ class TestForceReloadSymmetry:
         assert elapsed < 5.0
         hold.set()
 
+    def test_hung_callback_does_not_block_later_distinct_calls(self, monkeypatch):
+        """Post-timeout suppression is scoped to the hung CALL IDENTITY, not the whole
+        callback: a later, distinctly-identified call must still execute (a research
+        finalizer's post_tool_call evidence must not be dropped), while a repeat of the
+        SAME identity stays suppressed while its worker is still running (carried; replaces
+        cluster patch 0003)."""
+        import time
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.05
+        )
+        hold = threading.Event()
+        starts = []
+
+        def hangs_forever(**kwargs):
+            starts.append(kwargs.get("tool_call_id"))
+            hold.wait(timeout=5.0)
+            return "late"
+
+        mgr = PluginManager()
+        mgr._hook_timeout_suppression_seconds = 0.05
+        mgr._hooks["post_tool_call"] = [hangs_forever]
+
+        try:
+            t0 = time.monotonic()
+            assert mgr.invoke_hook("post_tool_call", tool_call_id="call-1") == []
+            assert time.monotonic() - t0 < 1.0
+
+            t1 = time.monotonic()
+            assert mgr.invoke_hook("post_tool_call", tool_call_id="call-2") == []
+            assert time.monotonic() - t1 < 1.0
+
+            t2 = time.monotonic()
+            assert mgr.invoke_hook("post_tool_call", tool_call_id="call-1") == []
+            assert time.monotonic() - t2 < 1.0
+
+            assert starts.count("call-1") == 1  # call-1's worker is still running: not duplicated
+            assert starts.count("call-2") == 1  # a distinct identity is never suppressed
+        finally:
+            hold.set()
+
     def test_concurrent_same_tool_calls_with_distinct_ids_both_run(self, monkeypatch):
         """Two concurrent calls of one tool are different work, not a duplicate (#98382)."""
         import time
@@ -1643,10 +1684,10 @@ class TestForceReloadSymmetry:
 
     def test_hung_worker_does_not_fail_closed_forever(self, monkeypatch):
         """One never-returning pre_tool_call guard must not block every later tool call until
-        restart: after the suppression window a fresh call id runs a new worker, so a callback
-        that has recovered decides again (#105223)."""
-        import time
-
+        restart: the post-timeout suppression window is scoped to the hung CALL IDENTITY, not
+        the whole callback, so a fresh call id runs a new worker immediately — a callback that
+        has recovered decides again for its own identity (#105223), and a distinct identity is
+        never made to wait behind an unrelated hang (carried; replaces cluster patch 0003)."""
         from hermes_cli.plugins import _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
 
         monkeypatch.setattr(
@@ -1667,9 +1708,10 @@ class TestForceReloadSymmetry:
 
         blocked = [{"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE}]
         assert mgr.invoke_hook("pre_tool_call", tool_name="read_file", tool_call_id="call-a") == blocked
-        assert mgr.invoke_hook("pre_tool_call", tool_name="read_file", tool_call_id="call-b") == blocked  # in window
-        time.sleep(0.3)  # suppression window passes; the first worker is still hung
-        assert mgr.invoke_hook("pre_tool_call", tool_name="read_file", tool_call_id="call-c") == []
+        # A distinct call identity is not suppressed by call-a's still-open timeout window.
+        assert mgr.invoke_hook("pre_tool_call", tool_name="read_file", tool_call_id="call-b") == []
+        # A repeat of call-a's own identity stays suppressed within its own window.
+        assert mgr.invoke_hook("pre_tool_call", tool_name="read_file", tool_call_id="call-a") == blocked
         assert len(starts) == 2
         hold.set()
 
