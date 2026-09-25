@@ -20,6 +20,13 @@ describe('classifyProbe', () => {
     expect(classifyProbe(result({ ok: false, error }))).toBe('needs-auth')
   })
 
+  it.each([
+    'Connection timed out after 10s (raise connect_timeout, or complete an OAuth login also by oauth.timeout)',
+    "Failed to connect to MCP server 'cluster-research': CancelledError"
+  ])('classifies timeout "%s" as error, not needs-auth', error => {
+    expect(classifyProbe(result({ ok: false, error }))).toBe('error')
+  })
+
   it('classifies other failures as error', () => {
     expect(classifyProbe(result({ ok: false, error: 'ECONNREFUSED 127.0.0.1:3845' }))).toBe('error')
   })

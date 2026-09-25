@@ -8,6 +8,9 @@ import type { McpTestResult } from '@/hermes'
 // ---------------------------------------------------------------------------
 
 export const NEEDS_AUTH_RE = /\b(401|unauthorized|forbidden|invalid[_ ]?token|authentication|oauth)\b/i
+// A timeout is never an auth failure, even when its text mentions OAuth (e.g. "...an OAuth login also
+// by oauth.timeout"): classifying it as needs-auth sent an unauthenticated server into a failing OAuth flow.
+export const TIMEOUT_RE = /\b(timed out|timeout|cancellederror)\b/i
 
 // Probe results outlive any component: each probe is a real connect/disconnect,
 // so re-entering the MCP page (or a background sweep) must not re-probe the
@@ -39,5 +42,7 @@ export function classifyProbe(result: McpTestResult): 'error' | 'needs-auth' | '
     return 'ok'
   }
 
-  return NEEDS_AUTH_RE.test(result.error ?? '') ? 'needs-auth' : 'error'
+  const error = result.error ?? ''
+
+  return NEEDS_AUTH_RE.test(error) && !TIMEOUT_RE.test(error) ? 'needs-auth' : 'error'
 }
