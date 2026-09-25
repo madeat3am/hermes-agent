@@ -926,6 +926,38 @@ async def test_websocket_loop_holds_quiet_relay_with_library_iterator(monkeypatc
             pass
 
 
+class _CancelOnRecvWebSocket(_FakeWebSocket):
+    """The first ``recv()`` cancels the signing-in task in the same step that it completes.
+
+    That is the Python 3.11 race exactly: under ``asyncio.wait_for`` the read runs in a child task, so
+    the cancel lands on the waiting caller while the read finishes, and ``wait_for`` returns the read
+    instead of raising.  Awaited directly (``asyncio.timeout``), the cancel stays pending on the task.
+    """
+
+    def __init__(self, owner):
+        super().__init__()
+        self._owner = owner
+        self._cancelled = False
+
+    async def recv(self):
+        if not self._cancelled:
+            self._cancelled = True
+            self._owner["task"].cancel()
+        return await super().recv()
+
+
+@pytest.mark.asyncio
+async def test_relay_sign_in_keeps_a_cancel_that_lands_as_recv_completes():
+    adapter = _make_adapter()
+    owner = {}
+    websocket = _CancelOnRecvWebSocket(owner)
+    task = asyncio.create_task(adapter._authenticate_websocket(websocket))
+    owner["task"] = task
+    done, _ = await asyncio.wait({task}, timeout=2.0)
+    assert done, "sign-in never finished"
+    assert task.cancelled(), "sign-in dropped a cancel that landed as its read completed"
+
+
 @pytest.mark.asyncio
 async def test_websocket_loop_honors_cancel_during_relay_sign_in(monkeypatch):
     """A cancel that lands while a relay sign-in read completes must stop the reconnect loop.
@@ -954,6 +986,7 @@ async def test_websocket_loop_honors_cancel_during_relay_sign_in(monkeypatch):
         deadline = time.monotonic() + 5.0
         while len(sockets) < 2 and time.monotonic() < deadline:
             await asyncio.sleep(0.02)
+        assert len(sockets) >= 2, "the dead first connection was never replaced"
         task.cancel()  # lands while the fresh socket's instant sign-in reads complete
         done, _ = await asyncio.wait({task}, timeout=1.0)
         assert done, "the reconnect loop swallowed a cancel during relay sign-in"
