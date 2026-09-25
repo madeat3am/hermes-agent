@@ -1177,6 +1177,11 @@ class BuzzAdapter(BasePlatformAdapter):
         connection's keepalive round-trip is still changing — only a connection with no liveness
         progress for ``_WS_LIVENESS_STALL_LIMIT`` consecutive slices is declared dead (#98097,
         scout-buzz section 3: 2199 of 2301 disconnects were quiet-healthy relays at a fixed 301s cadence).
+
+        Each slice is bounded with ``asyncio.wait`` + detach-without-join, not ``asyncio.wait_for``: a
+        transport receive stuck below asyncio can ignore cancellation forever (#112049), and
+        ``wait_for``/``gather`` would then block waiting for that cancellation to be acknowledged,
+        holding the whole liveness bound hostage.
         """
         frame_iter = websocket.__aiter__()
         previous_pong: object = _WS_PONG_SAMPLE_UNSET
@@ -1185,22 +1190,35 @@ class BuzzAdapter(BasePlatformAdapter):
         while True:
             read_task = asyncio.ensure_future(frame_iter.__anext__())
             try:
-                raw = await asyncio.wait_for(frame_iter.__anext__(), timeout=slice_timeout)
-            except StopAsyncIteration:
-                return
-            except asyncio.TimeoutError:
-                current = self._websocket_pong_latency(websocket)
-                if current is not None and current != previous_pong:
-                    # Keepalive progress: the relay (or transport) is answering pings — healthy silence.
-                    previous_pong, pong_stall = current, 0
-                    continue
-                pong_stall += 1
-                if pong_stall >= _WS_LIVENESS_STALL_LIMIT:
+                done, _ = await asyncio.wait(
+                    {read_task}, timeout=slice_timeout, return_when=asyncio.FIRST_COMPLETED
+                )
+                if not done:
+                    # No frame within this liveness slice — check keepalive pong progress before
+                    # declaring the connection dead; a quiet-but-healthy relay can go minutes
+                    # without a data frame while its ping/pong keepalive keeps succeeding.
+                    current = self._websocket_pong_latency(websocket)
+                    if current is not None and current != previous_pong:
+                        previous_pong, pong_stall = current, 0
+                        continue
+                    pong_stall += 1
+                    if pong_stall < _WS_LIVENESS_STALL_LIMIT:
+                        continue
+                    # Detach instead of joining (see docstring): do not await read_task's cancellation.
                     raise ConnectionError(
                         f"no WebSocket frame or keepalive progress for ~{slice_timeout * pong_stall:.0f}s"
                         f" (idle budget {_WS_READ_IDLE_TIMEOUT:.0f}s); assuming the connection went silent"
-                    ) from None
-                continue
+                    )
+                previous_pong, pong_stall = _WS_PONG_SAMPLE_UNSET, 0  # a frame is direct liveness proof
+                raw = read_task.result()
+            except StopAsyncIteration:
+                # A clean relay close is still a disconnect: raising sends it through the same
+                # backoff + "retrying" path instead of reconnecting in a hot loop.
+                raise ConnectionError("relay closed the WebSocket") from None
+            finally:
+                if not read_task.done():
+                    read_task.cancel()
+                    read_task.add_done_callback(_consume_ws_read_task)
             try:
                 message = json.loads(raw)
             except (ValueError, TypeError):
