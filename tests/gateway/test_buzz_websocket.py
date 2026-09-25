@@ -7,6 +7,7 @@ lifecycle as wired into BuzzAdapter.
 """
 
 import asyncio
+import inspect
 import json
 import time
 
@@ -861,6 +862,105 @@ async def test_websocket_loop_holds_quiet_relay_beyond_idle_budget(monkeypatch):
             await asyncio.wait_for(task, 5.0)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
+
+
+class _AsyncGenLivenessWebSocket(_LivenessWebSocket):
+    """Iterates like ``websockets`` itself: ``__aiter__`` is an async generator over ``recv()``.
+
+    Cancelling a pending ``__anext__()`` finalizes such an iterator, so a reader that cancels its
+    read at every quiet liveness slice sees StopAsyncIteration on the next read while the socket is
+    still open.  The scripted fakes above hand out a fresh coroutine per ``__anext__`` and hid that.
+    """
+
+    async def __aiter__(self):
+        while True:
+            yield await self._anext_behavior()
+
+
+def test_websockets_connection_iterator_is_an_async_generator():
+    from websockets.asyncio.connection import Connection
+
+    assert inspect.isasyncgenfunction(Connection.__aiter__), (
+        "_AsyncGenLivenessWebSocket models Connection.__aiter__ as an async generator"
+    )
+
+
+@pytest.mark.asyncio
+async def test_websocket_loop_holds_quiet_relay_with_library_iterator(monkeypatch, caplog):
+    """A quiet-but-healthy relay stays on one connection when the iterator is an async generator.
+
+    Regression (2026-09-25): the liveness slice cancelled its pending read, which killed the
+    library iterator, and every quiet minute ended as "relay closed the WebSocket" and a reconnect.
+    """
+    import logging
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(_buzz_mod, "_WS_READ_IDLE_TIMEOUT", 0.2)
+    caplog.set_level(logging.WARNING)
+
+    sockets = []
+
+    async def silent_recv():
+        await asyncio.Event().wait()  # a quiet relay yields no data frames at all
+
+    def fake_connect(*args, **kwargs):
+        ws = _AsyncGenLivenessWebSocket(silent_recv, changing=True)
+        sockets.append(ws)
+        return ws
+
+    import websockets as _ws_mod
+
+    monkeypatch.setattr(_ws_mod, "connect", fake_connect)
+
+    task = asyncio.create_task(adapter._websocket_loop())
+    try:
+        await asyncio.sleep(1.2)  # six liveness slices with zero data frames
+        assert len(sockets) == 1, "a quiet relay with answered keepalive pings was disconnected"
+        assert not sockets[0].exited
+        assert not any("relay closed" in record.message for record in caplog.records)
+    finally:
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, 5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_websocket_loop_honors_cancel_during_relay_sign_in(monkeypatch):
+    """A cancel that lands while a relay sign-in read completes must stop the reconnect loop.
+
+    On Python 3.11 ``asyncio.wait_for`` returns a read that finished alongside the cancel and drops
+    the cancel, so a gateway shutdown during sign-in left the loop reconnecting.
+    """
+    adapter = _make_adapter()
+    monkeypatch.setattr(_buzz_mod, "_WS_READ_IDLE_TIMEOUT", 0.05)
+    sockets = []
+
+    async def dead_anext():
+        await asyncio.Event().wait()
+
+    def fake_connect(*args, **kwargs):
+        ws = _LivenessWebSocket(dead_anext, changing=False)
+        sockets.append(ws)
+        return ws
+
+    import websockets as _ws_mod
+
+    monkeypatch.setattr(_ws_mod, "connect", fake_connect)
+
+    task = asyncio.create_task(adapter._websocket_loop())
+    try:
+        deadline = time.monotonic() + 5.0
+        while len(sockets) < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        task.cancel()  # lands while the fresh socket's instant sign-in reads complete
+        done, _ = await asyncio.wait({task}, timeout=1.0)
+        assert done, "the reconnect loop swallowed a cancel during relay sign-in"
+    finally:
+        while not task.done():
+            task.cancel()
+            await asyncio.wait({task}, timeout=0.5)
 
 
 @pytest.mark.asyncio

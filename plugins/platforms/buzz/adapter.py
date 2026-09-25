@@ -1005,7 +1005,9 @@ class BuzzAdapter(BasePlatformAdapter):
 
     async def _authenticate_websocket(self, websocket) -> None:
         """NIP-42: await the AUTH challenge, answer with a signed kind-22242 event (+ optional NIP-OA tag), await OK."""
-        message = json.loads(await asyncio.wait_for(websocket.recv(), timeout=_WS_AUTH_TIMEOUT))
+        # asyncio.timeout, not wait_for: on 3.11 wait_for drops a cancel that lands as recv() completes.
+        async with asyncio.timeout(_WS_AUTH_TIMEOUT):
+            message = json.loads(await websocket.recv())
         if not isinstance(message, list) or len(message) < 2 or message[0] != "AUTH":
             raise ConnectionError("Buzz relay did not send a NIP-42 AUTH challenge")
         # BUZZ_AUTH_TAG is per-identity: a scoped profile without one fails closed to "" rather than borrowing
@@ -1025,7 +1027,8 @@ class BuzzAdapter(BasePlatformAdapter):
         event = _nostr_auth.build_auth_event(private_key=self._private_key, challenge=str(message[1]), relay_url=self._websocket_url(), auth_tag_json=auth_tag)
         await websocket.send(json.dumps(["AUTH", event], separators=(",", ":")))
         while True:
-            response = json.loads(await asyncio.wait_for(websocket.recv(), timeout=_WS_AUTH_TIMEOUT))
+            async with asyncio.timeout(_WS_AUTH_TIMEOUT):
+                response = json.loads(await websocket.recv())
             if not isinstance(response, list) or not response:
                 continue
             if response[0] == "OK" and len(response) >= 4 and response[1] == event["id"]:
@@ -1182,14 +1185,20 @@ class BuzzAdapter(BasePlatformAdapter):
         transport receive stuck below asyncio can ignore cancellation forever (#112049), and
         ``wait_for``/``gather`` would then block waiting for that cancellation to be acknowledged,
         holding the whole liveness bound hostage.
+
+        One read spans the slices: a slice that times out keeps the same pending read.  Cancelling
+        ``__anext__()`` finalizes the library's async-generator iterator while the socket stays open,
+        so the next read ended as a false "relay closed the WebSocket" after every quiet minute.
         """
         frame_iter = websocket.__aiter__()
         previous_pong: object = _WS_PONG_SAMPLE_UNSET
         pong_stall = 0
         slice_timeout = min(_WS_LIVENESS_SLICE, max(_WS_READ_IDLE_TIMEOUT, 0.05))
-        while True:
-            read_task = asyncio.ensure_future(frame_iter.__anext__())
-            try:
+        read_task: Optional[asyncio.Future] = None
+        try:
+            while True:
+                if read_task is None:
+                    read_task = asyncio.ensure_future(frame_iter.__anext__())
                 done, _ = await asyncio.wait(
                     {read_task}, timeout=slice_timeout, return_when=asyncio.FIRST_COMPLETED
                 )
@@ -1204,28 +1213,30 @@ class BuzzAdapter(BasePlatformAdapter):
                     pong_stall += 1
                     if pong_stall < _WS_LIVENESS_STALL_LIMIT:
                         continue
-                    # Detach instead of joining (see docstring): do not await read_task's cancellation.
                     raise ConnectionError(
                         f"no WebSocket frame or keepalive progress for ~{slice_timeout * pong_stall:.0f}s"
                         f" (idle budget {_WS_READ_IDLE_TIMEOUT:.0f}s); assuming the connection went silent"
                     )
                 previous_pong, pong_stall = _WS_PONG_SAMPLE_UNSET, 0  # a frame is direct liveness proof
-                raw = read_task.result()
-            except StopAsyncIteration:
-                # A clean relay close is still a disconnect: raising sends it through the same
-                # backoff + "retrying" path instead of reconnecting in a hot loop.
-                raise ConnectionError("relay closed the WebSocket") from None
-            finally:
-                if not read_task.done():
-                    read_task.cancel()
-                    read_task.add_done_callback(_consume_ws_read_task)
-            try:
-                message = json.loads(raw)
-            except (ValueError, TypeError):
-                logger.warning("Buzz: ignoring malformed WebSocket frame")
-                continue
-            if isinstance(message, list) and message:
-                await self._handle_ws_message(websocket, subscriptions, message)
+                finished, read_task = read_task, None
+                try:
+                    raw = finished.result()
+                except StopAsyncIteration:
+                    # A clean relay close is still a disconnect: raising sends it through the same
+                    # backoff + "retrying" path instead of reconnecting in a hot loop.
+                    raise ConnectionError("relay closed the WebSocket") from None
+                try:
+                    message = json.loads(raw)
+                except (ValueError, TypeError):
+                    logger.warning("Buzz: ignoring malformed WebSocket frame")
+                    continue
+                if isinstance(message, list) and message:
+                    await self._handle_ws_message(websocket, subscriptions, message)
+        finally:
+            if read_task is not None:
+                # Detach instead of joining (see docstring): cancel without awaiting the acknowledgement.
+                read_task.cancel()
+                read_task.add_done_callback(_consume_ws_read_task)
 
     async def _handle_ws_message(self, websocket, subscriptions: Dict[str, Optional[str]], message: list) -> None:
         """Route one parsed relay frame (EVENT / CLOSED / NOTICE)."""
