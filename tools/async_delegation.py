@@ -760,26 +760,34 @@ def _dispatch_admitted(
 
     from hermes_cli.backend_retirement import retirement
 
-    _persist_dispatch(record)
-    # Units sharing one slot still require independent executor capacity.
-    executor = _get_executor(max(max_async_children, live_units))
-
     # The outer dispatch reservation prevents a freeze during this handoff. Retain a worker
     # reservation too: the stall monitor may finalize its registry record before it really exits.
+    future = None
+    error = "Dispatch exited before submission"
     retirement.acquire()
     try:
+        _persist_dispatch(record)
+        # Units sharing one slot still require independent executor capacity.
+        executor = _get_executor(max(max_async_children, live_units))
         future = executor.submit(propagate_context_to_thread(_worker))
         future.add_done_callback(lambda _: retirement.release())
-    except Exception as exc:  # pragma: no cover — pool submit failure is rare
+    except Exception as exc:
         retirement.release()
-        with _records_lock:
-            _records.pop(delegation_id, None)
-        with _DB_LOCK, _transaction() as conn:
-            conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
-        return {"status": "rejected", "error": f"Failed to schedule async delegation{label}: {exc}"}
-    # Publish the transition out of REGISTERED so the worker's spin-wait (and any one-shot-shutdown
-    # or stale-monitor reader of _dispatch_phase()) sees SUBMITTED instead of racing on the record.
-    record["_dispatch"] = _DispatchLifecycle(_DispatchPhase.SUBMITTED, future)
+        error = f"Failed to schedule async delegation{label}: {exc}"
+    finally:
+        # One immutable publication: no exit (including rollback/monitor errors) leaves a
+        # registration waiting for a submit that can never happen. The worker's spin-wait (and
+        # any one-shot-shutdown or stale-monitor reader of _dispatch_phase()) sees this phase.
+        record["_dispatch"] = _DispatchLifecycle(
+            _DispatchPhase.SUBMITTED if future is not None else _DispatchPhase.FAILED,
+            future, None if future is not None else error)
+        if future is None:
+            try:
+                _finalize(delegation_id, crash_result(error, 0), "error")
+            except Exception:
+                logger.warning("Failed dispatch terminal write unfinished; ownership retained", exc_info=True)
+    if future is None:
+        return {"status": "rejected", "error": error}
     if progress_fn is not None:
         try:
             _ensure_stale_monitor()
