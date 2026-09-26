@@ -3829,14 +3829,23 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # operator override). 503 + Retry-After reschedules the job via NAS
             # retry or the misfire backstop rather than silently dropping it —
             # matches _CRON_FIRE_RETRY_AFTER_SECONDS in web_routers/cron.py.
-            with suppress(ImportError):
+            # Fail closed: an unimportable estop gate refuses the fire too, never
+            # resolving/claiming/firing.
+            try:
                 from agent.estop import check_paused as _estop_check_paused
-                if _estop_check_paused("cron-webhook", logger):
-                    return web.json_response(
-                        {"error": "hermes is paused (ESTOP)", "job_id": job_id},
-                        status=503,
-                        headers={"Retry-After": str(60)},
-                    )
+            except ImportError:
+                logger.warning("cron fire: estop gate unimportable; failing closed for %s", job_id)
+                return web.json_response(
+                    {"error": "hermes is paused (ESTOP)", "job_id": job_id},
+                    status=503,
+                    headers={"Retry-After": str(60)},
+                )
+            if _estop_check_paused("cron-webhook", logger):
+                return web.json_response(
+                    {"error": "hermes is paused (ESTOP)", "job_id": job_id},
+                    status=503,
+                    headers={"Retry-After": str(60)},
+                )
             from cron.scheduler_provider import provider_supports_split_fire, resolve_cron_scheduler
             provider = resolve_cron_scheduler()
             loop = asyncio.get_running_loop()
