@@ -280,10 +280,13 @@ def fire_overdue_jobs(
     # next housekeeping pass after `hermes resume` catches overdue work up
     # through the existing claim_fire path. Distinct component name from the
     # ticker's "cron" so the log-once mechanism fires independently.
-    with contextlib.suppress(ImportError):
+    # Fail closed: an unimportable estop gate skips the sweep too, never claims/fires.
+    try:
         from agent.estop import check_paused as _estop_check_paused
-        if _estop_check_paused("cron-misfire", logger):
-            return 0
+    except ImportError:
+        return 0
+    if _estop_check_paused("cron-misfire", logger):
+        return 0
 
     from datetime import datetime
 

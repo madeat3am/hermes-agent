@@ -1,7 +1,6 @@
 """In-process tick admission and dispatch; job execution stays in scheduler.py."""
 
 import concurrent.futures
-import contextlib
 
 
 def tick(verbose=True, adapters=None, loop=None, sync=True, *, can_dispatch=None):
@@ -38,10 +37,13 @@ def _tick_admitted(
 
     try:
         # `hermes pause` ESTOP: skip dispatch, never touch in-flight runs; check_paused logs once.
-        with contextlib.suppress(ImportError):
+        # Fail closed: an unimportable estop gate skips the scan too, never dispatches.
+        try:
             from agent.estop import check_paused as _estop_check_paused
-            if _estop_check_paused("cron", _sched.logger):
-                return 0
+        except ImportError:
+            return 0
+        if _estop_check_paused("cron", _sched.logger):
+            return 0
 
         if can_dispatch is not None and not can_dispatch():
             _sched.logger.debug("Cron dispatch paused while gateway drains existing work")
