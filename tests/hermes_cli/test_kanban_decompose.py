@@ -256,3 +256,41 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert outcome.ok is False
 
 
+def test_auto_decompose_lists_only_untouched_triage_intake(kanban_home):
+    """Human-intervention triage must never be treated as rough LLM intake."""
+    with kbc.connect() as conn:
+        intake = kb.create_task(conn, title="rough idea", triage=True)
+
+        # A Reviewer-shaped established task reaches triage through the block
+        # loop breaker after real worker runs.  Its exact body is evidence and
+        # must not be handed to the decomposer for rewriting.
+        escalated = kb.create_task(
+            conn,
+            title="independent review",
+            body="request_id: req-1\nartifact_path: /tmp/report.md",
+            assignee="reviewer",
+        )
+        assert kb.claim_task(conn, escalated, claimer="reviewer") is not None
+        assert kb.block_task(conn, escalated, reason="binding unavailable", kind="capability")
+        assert kb.unblock_task(conn, escalated)
+        assert kb.claim_task(conn, escalated, claimer="reviewer") is not None
+        assert kb.block_task(conn, escalated, reason="binding unavailable", kind="capability")
+        assert kb.get_task(conn, escalated).status == "triage"
+
+        # Board import parks an otherwise untouched ready task in triage when
+        # its machine-local workspace cannot travel.  No run exists, so the
+        # immutable created status is the discriminator.
+        imported_parked = kb.create_task(conn, title="repair imported workspace")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (imported_parked,))
+
+        # A previously processed intake card is not fresh intake if another
+        # surface later moves it back into triage before its first run.
+        processed = kb.create_task(conn, title="already specified", triage=True)
+        assert kb.specify_triage_task(conn, processed, body="concrete work")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (processed,))
+
+    assert set(decomp.list_triage_ids()) == {intake, escalated, imported_parked, processed}
+    assert decomp.list_auto_decompose_ids() == [intake]
+

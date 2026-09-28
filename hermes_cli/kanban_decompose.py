@@ -343,6 +343,56 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     return [row.id for row in rows]
 
 
+def list_auto_decompose_ids(*, tenant: Optional[str] = None) -> list[str]:
+    """Return untouched intake cards eligible for automatic decomposition.
+
+    ``triage`` has two meanings: rough intake that may be rewritten by the
+    decomposer, and an existing work item parked there for human intervention
+    (for example after a repeated worker block or a board import with a local
+    workspace path).  Only cards created in triage, never run, and never
+    previously specified/decomposed belong to the first class.
+
+    The immutable ``created`` event is the provenance source.  Missing or
+    malformed legacy provenance fails closed so auto-decomposition cannot
+    rewrite an established task merely because its current status is triage.
+    Manual ``decompose TASK`` and ``decompose --all`` keep using
+    :func:`list_triage_ids` and remain available for deliberate recovery.
+    """
+    tenant_sql = " AND t.tenant = ?" if tenant is not None else ""
+    params = (tenant,) if tenant is not None else ()
+    with kbc.connect_closing() as conn:
+        rows = conn.execute(
+            """
+            SELECT t.id,
+                   (SELECT e.payload
+                      FROM task_events e
+                     WHERE e.task_id = t.id AND e.kind = 'created'
+                     ORDER BY e.id ASC LIMIT 1) AS created_payload
+              FROM tasks t
+             WHERE t.status = 'triage'
+            """
+            + tenant_sql
+            + """
+               AND NOT EXISTS (
+                    SELECT 1 FROM task_runs r WHERE r.task_id = t.id
+               )
+               AND NOT EXISTS (
+                    SELECT 1 FROM task_events e
+                     WHERE e.task_id = t.id
+                       AND e.kind IN ('specified', 'decomposed')
+               )
+             ORDER BY t.priority DESC, t.created_at ASC
+             LIMIT 1000
+            """,
+            params,
+        ).fetchall()
+    return [
+        row["id"]
+        for row in rows
+        if kb._json_dict(row["created_payload"]).get("status") == "triage"
+    ]
+
+
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
 # Names external plugins imported from this module before the Sep 2026 decomposition.
 # Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
