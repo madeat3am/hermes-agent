@@ -9,7 +9,6 @@ Tests cover:
 
 import json
 import os
-import re
 import subprocess
 import sys
 import textwrap
@@ -86,6 +85,55 @@ def test_cronjob_tool_rejects_stale_past_one_shot(cron_env, monkeypatch):
 
 class TestRunJobScript:
     """Test the _run_job_script() function."""
+
+    def test_python_script_uses_installation_dependency_bootstrap(self, tmp_path, monkeypatch):
+        """Cron must not inherit a dependency-missing scheduler interpreter.
+
+        Gateway and desktop processes may start with a store/base interpreter while Hermes'
+        selected dependency generation contains packages required by the script.  The launcher
+        bootstrap owns that selection and lease; a bare ``sys.executable script.py`` bypasses it.
+        """
+        from cron import scheduler_script
+        from hermes_cli import _launchers
+
+        script = tmp_path / "probe.py"
+        script.write_text("import ruamel.yaml\n", encoding="utf-8")
+        seen = {}
+
+        def fake_runtime_command(root, args, *, code):
+            seen.update(root=root, args=args, code=code)
+            return ["/managed/python", "-I", "-c", "bootstrap", *args]
+
+        monkeypatch.setattr(_launchers, "runtime_command", fake_runtime_command)
+        monkeypatch.setattr(scheduler_script.sys, "executable", "/bare/python-without-yaml")
+
+        argv, overlay, error = scheduler_script._script_argv(script)
+
+        assert error is None
+        assert overlay == {}
+        assert argv == ["/managed/python", "-I", "-c", "bootstrap", str(script)]
+        assert seen["root"] == Path(scheduler_script.__file__).resolve().parents[1]
+        assert seen["args"] == [str(script)]
+        assert "runpy.run_path" in seen["code"]
+        assert "/bare/python-without-yaml" not in argv
+
+    def test_python_script_bootstrap_preserves_script_import_and_argv_semantics(self, cron_env):
+        from cron.scheduler_script import _run_job_script
+
+        scripts = cron_env / "scripts"
+        (scripts / "sibling.py").write_text("VALUE = 'dependency-ready'\n", encoding="utf-8")
+        script = scripts / "probe.py"
+        script.write_text(
+            "import pathlib, sibling, sys, ruamel.yaml\n"
+            "print(sibling.VALUE, ruamel.yaml.__name__)\n"
+            "print(pathlib.Path(sys.argv[0]).resolve())\n",
+            encoding="utf-8",
+        )
+
+        success, output = _run_job_script("probe.py")
+
+        assert success is True
+        assert output.splitlines() == ["dependency-ready ruamel.yaml", str(script.resolve())]
 
     def test_successful_script(self, cron_env):
         from cron.scheduler_script import _run_job_script
@@ -164,29 +212,16 @@ class TestRunJobScript:
         assert output == "ABSENT"
 
     @pytest.mark.platforms("windows")
-    def test_windows_uv_venv_python_script_bypasses_launcher(self, cron_env, tmp_path, monkeypatch):
-        # Windows-only: the fake ``sys.platform`` could not reproduce the
-        # ``Scripts/python.exe`` launcher layout or the CREATE_NO_WINDOW
-        # creationflags this branch exists for.
+    def test_windows_python_script_uses_managed_bootstrap_without_console(
+        self, cron_env, monkeypatch
+    ):
         from cron import scheduler as sched_mod
         from cron import scheduler_script as sched_script
         from cron.scheduler_script import _run_job_script
+        from hermes_cli import _launchers
 
         script = cron_env / "scripts" / "probe.py"
         script.write_text('print("ok")\n')
-
-        venv = tmp_path / "venv"
-        venv_scripts = venv / "Scripts"
-        site_packages = venv / "Lib" / "site-packages"
-        base = tmp_path / "base"
-        venv_scripts.mkdir(parents=True)
-        site_packages.mkdir(parents=True)
-        base.mkdir()
-        venv_python = venv_scripts / "python.exe"
-        base_python = base / "python.exe"
-        venv_python.write_text("", encoding="utf-8")
-        base_python.write_text("", encoding="utf-8")
-        (venv / "pyvenv.cfg").write_text(f"home = {base}\nuv = true\n", encoding="utf-8")
 
         captured = {}
 
@@ -207,7 +242,11 @@ class TestRunJobScript:
 
         fake_run = FakeProc
 
-        monkeypatch.setattr(sched_mod.sys, "executable", str(venv_python))
+        monkeypatch.setattr(
+            _launchers,
+            "runtime_command",
+            lambda _root, args, *, code: ["C:/Hermes/python.exe", "-I", "-c", code, *args],
+        )
         monkeypatch.setattr(sched_script, "windows_hide_flags", lambda: 0x08000000)
         monkeypatch.setattr(sched_mod.subprocess, "Popen", fake_run)
 
@@ -215,15 +254,9 @@ class TestRunJobScript:
 
         assert success is True
         assert output == "ok"
-        # Overlay mode bootstraps with site.addsitedir() so .pth files
-        # (editable installs) are processed — plain PYTHONPATH cannot do that.
-        assert captured["argv"][0] == str(base_python)
-        assert captured["argv"][1] == "-c"
-        assert "site.addsitedir" in captured["argv"][2]
-        m = re.search(r"site\.addsitedir\('([^']*)'\)", captured["argv"][2])
-        assert m is not None
-        assert Path(m.group(1)) == site_packages
-        assert captured["argv"][3] == str(script.resolve())
+        assert captured["argv"][:3] == ["C:/Hermes/python.exe", "-I", "-c"]
+        assert "runpy.run_path" in captured["argv"][3]
+        assert captured["argv"][4] == str(script.resolve())
         # The script runner always adds CREATE_NEW_PROCESS_GROUP on win32 so a
         # cancel can taskkill the whole tree; on POSIX the getattr default is
         # 0 and the flag set is exactly windows_hide_flags().
@@ -231,9 +264,6 @@ class TestRunJobScript:
             sched_mod.subprocess, "CREATE_NEW_PROCESS_GROUP", 0
         )
         assert captured["kwargs"]["creationflags"] == expected_flags
-        env = captured["kwargs"]["env"]
-        assert env["VIRTUAL_ENV"] == str(venv)
-        assert str(site_packages) in env["PYTHONPATH"]
 
     def test_bootstrap_argv_makes_pth_editable_installs_importable(self, cron_env, tmp_path):
         """The bootstrap must process .pth files — the whole reason the

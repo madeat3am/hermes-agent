@@ -317,7 +317,7 @@ def _resolve_script_path(script_path: str) -> tuple[Optional[Path], Optional[str
 def _script_argv(path: Path) -> tuple[Optional[list[str]], dict[str, str], Optional[str]]:
     """``(argv, env_overlay, error)`` for a validated script. Interpreter by extension — the
     shebang is deliberately NOT honoured (small, auditable surface): ``.sh``/``.bash`` → bash,
-    else ``sys.executable`` (Windows uv-venv overlay gets the .pth bootstrap)."""
+    else the installation bootstrap, which selects and leases Hermes' dependency generation."""
     if path.suffix.lower() in {".sh", ".bash"}:
         # which() finds Git Bash on Windows; None there → clear error instead of a "[WinError 2]".
         _bash = shutil.which("bash") or ("/bin/bash" if os.path.isfile("/bin/bash") else None)
@@ -328,10 +328,17 @@ def _script_argv(path: Path) -> tuple[Optional[list[str]], dict[str, str], Optio
                 "or rewrite the script as Python (.py)."
             )
         return [_bash, str(path)], {}, None
-    python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
-    if env_overlay:
-        return _windows_cron_bootstrap_argv(python_exe, env_overlay, str(path)), env_overlay, None
-    return [python_exe, str(path)], env_overlay, None
+    from hermes_cli._launchers import runtime_command
+
+    repo = Path(__file__).resolve().parents[1]
+    script_runner = (
+        "import os, runpy, sys;"
+        "script = sys.argv[1];"
+        "sys.argv = [script] + sys.argv[2:];"
+        "sys.path.insert(0, os.path.dirname(os.path.abspath(script)));"
+        "runpy.run_path(script, run_name='__main__')"
+    )
+    return runtime_command(repo, [str(path)], code=script_runner), {}, None
 
 
 def _run_job_script(
