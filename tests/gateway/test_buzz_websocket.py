@@ -151,7 +151,9 @@ async def test_websocket_loop_reconnects_when_read_goes_silent(monkeypatch, capl
     monkeypatch.setattr(_buzz_mod, "_WS_READ_IDLE_TIMEOUT", 0.05)
     caplog.set_level(logging.WARNING)
     states = []
+    rearmed = []
     monkeypatch.setattr(adapter, "_write_runtime_status_safe", lambda status, **kw: states.append(kw["platform_state"]))
+    monkeypatch.setattr(adapter, "_rearm_pending_replay", lambda reason: rearmed.append(reason))
 
     sockets = []
     release_parked_receive = asyncio.Event()
@@ -192,6 +194,7 @@ async def test_websocket_loop_reconnects_when_read_goes_silent(monkeypatch, capl
     assert sockets[0].exited, "the silent connection was not closed before reconnecting"
     assert any("went silent" in record.message for record in caplog.records)
     assert states[:2] == ["retrying", "connected"], f"health must flip to retrying and back, got {states}"
+    assert rearmed == ["WebSocket reconnect"]
 
 
 @pytest.mark.asyncio

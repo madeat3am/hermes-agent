@@ -1749,6 +1749,21 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
         both_photo = existing_is_photo and incoming_is_photo
         incoming_has_media = bool(event.media_urls)
 
+        def _merge_ingress_receipts() -> None:
+            """Keep adapter-owned admission receipts when two events become one turn.
+
+            The receiving adapter may need every transport event id to acknowledge a
+            durable inbox after the merged turn succeeds.  Unknown metadata remains
+            untouched; this only joins the one platform-neutral receipt list.
+            """
+            incoming = (event.metadata or {}).get("gateway_ingress_ack_ids")
+            if not isinstance(incoming, list):
+                return
+            current = (existing.metadata or {}).get("gateway_ingress_ack_ids")
+            merged = list(current) if isinstance(current, list) else []
+            merged.extend(value for value in incoming if value not in merged)
+            existing.metadata["gateway_ingress_ack_ids"] = merged
+
         def _padded_inline_flags(msg: MessageEvent) -> List[Optional[bool]]:
             flags = list(getattr(msg, "media_text_inlined", []) or [])
             return flags + [None] * (len(msg.media_urls) - len(flags))
@@ -1774,11 +1789,13 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
             for attr in ("_gateway_pending_stt_text", "_gateway_pending_stt_transcripts"):
                 if hasattr(existing, attr):
                     delattr(existing, attr)
+            _merge_ingress_receipts()
             return
         both_text = existing_type == MessageType.TEXT and event.message_type == MessageType.TEXT
         if merge_text and both_text:
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
+            _merge_ingress_receipts()
             return
     pending_messages[session_key] = event
 
@@ -3515,20 +3532,29 @@ class BasePlatformAdapter(ABC):
 
     async def _dispatch_inline_reply(self, event: MessageEvent, *, log_cmd: Optional[str] = None) -> None:
         """Call the handler and send its reply inline, with retry, threading and
-        ephemeral deletion — no session lifecycle (active-session bypass paths)."""
-        thread_meta = _thread_metadata_for_event(event)
-        response = await self._message_handler(event)
-        text, eph_ttl = self._unwrap_ephemeral(response)
-        if not text:
-            return
-        if log_cmd is not None:
-            logger.info("[%s] Sending command '/%s' response (%d chars) to %s", self.name, log_cmd,
-                        len(text), event.source.chat_id)
-        result = await self._send_with_retry(
-            chat_id=event.source.chat_id, content=text, reply_to=_reply_anchor_for_event(event),
-            metadata=_mark_notify_metadata(thread_meta))
-        if eph_ttl > 0 and result.success and result.message_id:
-            self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
+        ephemeral deletion. Active-session bypasses still run lifecycle hooks so
+        adapters with durable ingress can settle /stop, /reset, and clarify rows."""
+        event._gateway_accepted = True
+        await self._run_processing_hook("on_processing_start", event)
+        outcome = ProcessingOutcome.FAILURE
+        try:
+            thread_meta = _thread_metadata_for_event(event)
+            response = await self._message_handler(event)
+            text, eph_ttl = self._unwrap_ephemeral(response)
+            if not text:
+                outcome = ProcessingOutcome.SUCCESS
+                return
+            if log_cmd is not None:
+                logger.info("[%s] Sending command '/%s' response (%d chars) to %s", self.name, log_cmd,
+                            len(text), event.source.chat_id)
+            result = await self._send_with_retry(
+                chat_id=event.source.chat_id, content=text, reply_to=_reply_anchor_for_event(event),
+                metadata=_mark_notify_metadata(thread_meta))
+            if eph_ttl > 0 and result.success and result.message_id:
+                self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
+            outcome = ProcessingOutcome.SUCCESS if result.success else ProcessingOutcome.FAILURE
+        finally:
+            await self._run_processing_hook("on_processing_complete", event, outcome)
 
     def _media_delivery_scope(self, source: Optional[SessionSource]):
         """Routed home + terminal policy for post-handler text, media and error delivery;
@@ -3776,14 +3802,18 @@ class BasePlatformAdapter(ABC):
                 existing_pending = self._pending_messages.get(session_key)
                 if existing_pending is not None and self._can_merge_text_debounce_events(existing_pending, event):
                     merge_pending_message_event(self._pending_messages, session_key, event, merge_text=True)
+                    event._gateway_accepted = True
                 return
         now = time.monotonic()
         if state is None:
             state = TextDebounceState(event=event, task=None, first_ts=now, last_ts=now)
             store[session_key] = state
         else:
-            if event.text:
-                state.event.text = _append_text(state.event.text, event.text)
+            # Reuse the canonical merge seam so adapter-owned durable ingress
+            # receipts survive when several transport events become one turn.
+            buffered = {session_key: state.event}
+            merge_pending_message_event(buffered, session_key, event, merge_text=True)
+            state.event = buffered[session_key]
             latest_message_id = getattr(event, "message_id", None)
             latest_anchor = latest_message_id or getattr(event, "reply_to_message_id", None)
             if latest_message_id is not None:
@@ -3794,6 +3824,10 @@ class BasePlatformAdapter(ABC):
         state.cancel_timer()
         delay = self._text_debounce_delay(session_key)
         state.task = asyncio.create_task(self._flush_text_debounce(session_key, delay))
+        # Acceptance is published only after the event is owned by the buffer
+        # and its flush task exists. Durable adapters can now retain the receipt
+        # until that merged turn reaches their completion hook.
+        event._gateway_accepted = True
 
     async def _flush_text_debounce(self, session_key: str, delay: float) -> None:
         """Timer task that flushes the debounced text buffer."""
@@ -3888,7 +3922,7 @@ class BasePlatformAdapter(ABC):
         return True
 
     async def cancel_session_processing(self, session_key: str, *, release_guard: bool = True,
-                                        discard_pending: bool = True) -> None:
+                                        discard_pending: bool = True, terminal: bool = False) -> None:
         """Cancel in-flight processing for one session. ``release_guard=False`` keeps the guard so
         reset-like commands finish atomically; the await is bounded (5s) so a wedged finally can't
         stall."""
@@ -3896,6 +3930,10 @@ class BasePlatformAdapter(ABC):
         if task is not None and not task.done():
             logger.debug("[%s] Cancelling active processing for session %s", self.name, session_key)
             self._expected_cancelled_tasks.add(task)
+            # /stop, /new, and /reset deliberately retire the displaced input;
+            # shutdown cancellation must remain replayable for durable ingress.
+            if terminal:
+                task._gateway_terminal_cancel = True
             task.cancel()
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
@@ -3936,7 +3974,8 @@ class BasePlatformAdapter(ABC):
             # Send BEFORE cancelling so cancellation side effects can't drop the "/new"
             # confirmation.
             await self._dispatch_inline_reply(event, log_cmd=cmd)
-            await self.cancel_session_processing(session_key, release_guard=False, discard_pending=False)
+            await self.cancel_session_processing(
+                session_key, release_guard=False, discard_pending=False, terminal=True)
         except Exception:
             # On failure restore the original guard so the session isn't left half-reset.
             if self._active_sessions.get(session_key) is command_guard:
@@ -4547,7 +4586,10 @@ class BasePlatformAdapter(ABC):
                 self._spawn_drain_task(pending_event, session_key)
                 return  # Drain task owns the session now.
         except asyncio.CancelledError:
-            expected = asyncio.current_task() in self._expected_cancelled_tasks
+            current_task = asyncio.current_task()
+            expected = current_task in self._expected_cancelled_tasks
+            if expected and getattr(current_task, "_gateway_terminal_cancel", False):
+                event.metadata["gateway_terminal_cancel"] = True
             await self._run_processing_hook(
                 "on_processing_complete", event,
                 ProcessingOutcome.CANCELLED if expected else ProcessingOutcome.FAILURE)

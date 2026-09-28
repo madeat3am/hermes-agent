@@ -10,8 +10,8 @@ from types import SimpleNamespace
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from gateway.platforms.base import CachedMedia
-from gateway.platforms.event import MessageType
+from gateway.platforms.base import CachedMedia, merge_pending_message_event
+from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
 
 # Load plugins/platforms/buzz/adapter.py under a unique module name
@@ -3583,6 +3583,339 @@ class TestChannelCursorPersistence:
         saved = json.loads(self._cursor_file(tmp_path).read_text(encoding="utf-8"))
         assert saved["channels"][CHANNEL]["last_ts"] == 200
         assert saved["channels"][CHANNEL]["seen"] == ["e1", "e2"]
+        assert saved["channels"][CHANNEL]["pending"] == []
+
+    @pytest.mark.asyncio
+    async def test_crash_after_durable_admission_replays_once(self, adapter, tmp_path):
+        """The cursor may advance only with a durable copy of an unacknowledged event."""
+        await self._seed(adapter, _event("e1", content="@Chip first", created_at=100))
+
+        async def crash_after_admission(**_kwargs):
+            raise RuntimeError("simulated process loss")
+
+        adapter._dispatch_message = crash_after_admission
+        with pytest.raises(RuntimeError, match="simulated process loss"):
+            await adapter._handle_events(
+                CHANNEL,
+                adapter._channel_state[CHANNEL],
+                [_event("e2", content="@Chip recover me", created_at=200)],
+            )
+
+        saved = json.loads(self._cursor_file(tmp_path).read_text(encoding="utf-8"))
+        assert saved["channels"][CHANNEL]["seen"] == ["e1"]
+        assert [event["id"] for event in saved["channels"][CHANNEL]["pending"]] == ["e2"]
+
+        restarted = _make_adapter()
+        restarted._dispatched = []
+
+        async def capture(**kwargs):
+            restarted._dispatched.append(kwargs)
+
+        restarted._dispatch_message = capture
+        restarted._message_handler = AsyncMock()
+        restarted._load_cursors()
+        await restarted._seed_channel(CHANNEL, chat_type="group")
+        await restarted._replay_pending()
+        # Inclusive relay replay of e2 while it is in flight is suppressed.
+        await restarted._handle_event(
+            CHANNEL,
+            restarted._channel_state[CHANNEL],
+            _event("e2", content="@Chip recover me", created_at=200),
+        )
+        assert [row["message_id"] for row in restarted._dispatched] == ["e2"]
+
+    @pytest.mark.asyncio
+    async def test_success_ack_moves_pending_event_to_seen(self, adapter, tmp_path):
+        await self._seed(adapter, _event("e1", content="@Chip first", created_at=100))
+        state = adapter._channel_state[CHANNEL]
+        state["pending"]["e2"] = _event("e2", content="@Chip finish", created_at=200)
+        state["last_ts"] = 200
+        adapter._buzz_inflight.add("e2")
+        adapter._save_cursors()
+        source = adapter.build_source(
+            chat_id=CHANNEL, chat_type="group", user_id=OTHER_PUBKEY, message_id="e2")
+        event = MessageEvent(
+            text="finish", source=source, message_id="e2",
+            metadata={"gateway_ingress_ack_ids": ["e2"]},
+        )
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+        assert "e2" not in state["pending"]
+        assert "e2" in state["seen"]
+        saved = json.loads(self._cursor_file(tmp_path).read_text(encoding="utf-8"))
+        assert saved["channels"][CHANNEL]["pending"] == []
+        assert saved["channels"][CHANNEL]["seen"] == ["e1", "e2"]
+
+    @pytest.mark.asyncio
+    async def test_failure_keeps_pending_event_for_restart(self, adapter):
+        state = adapter._channel_state[CHANNEL] = adapter._new_channel_state("group")
+        state["pending"]["e2"] = _event("e2", content="@Chip retry", created_at=200)
+        adapter._buzz_inflight.add("e2")
+        source = adapter.build_source(
+            chat_id=CHANNEL, chat_type="group", user_id=OTHER_PUBKEY, message_id="e2")
+        event = MessageEvent(
+            text="retry", source=source, message_id="e2",
+            metadata={"gateway_ingress_ack_ids": ["e2"]},
+        )
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+        assert "e2" in state["pending"]
+        assert "e2" not in adapter._buzz_inflight
+        assert "e2" in adapter._buzz_replay_deferred
+        adapter._dispatch_message = AsyncMock()
+        await adapter._handle_event(
+            CHANNEL, state, _event("e2", content="@Chip retry", created_at=200))
+        adapter._dispatch_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_load_never_truncates_pending_wal_above_live_cap(self, adapter, tmp_path):
+        cap = _buzz_mod._PENDING_CAP
+        rows = [_event(f"pending-{i}", content="@Chip recover", created_at=i) for i in range(cap + 1)]
+        path = self._cursor_file(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "identity": SELF_PUBKEY,
+            "relay": "https://test.relay",
+            "channels": {CHANNEL: {
+                "chat_type": "group", "last_ts": cap, "seen": [], "pending": rows,
+            }},
+        }), encoding="utf-8")
+
+        adapter._load_cursors()
+        await adapter._seed_channel(CHANNEL, chat_type="group")
+        adapter._save_cursors()
+
+        assert len(adapter._channel_state[CHANNEL]["pending"]) == cap + 1
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        assert [row["id"] for row in saved["channels"][CHANNEL]["pending"]] == [
+            f"pending-{i}" for i in range(cap + 1)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_startup_replay_is_globally_bounded_and_completion_drains_next(self, adapter):
+        cap = _buzz_mod._REPLAY_INFLIGHT_CAP
+        second_channel = "second-channel"
+        states = {
+            CHANNEL: adapter._new_channel_state("group"),
+            second_channel: adapter._new_channel_state("group"),
+        }
+        adapter._channel_state = states
+        rows = [_event(f"recover-{i}", content="@Chip recover", created_at=i + 1)
+                for i in range(cap + 3)]
+        for i, row in enumerate(rows):
+            target = states[CHANNEL if i % 2 == 0 else second_channel]
+            target["pending"][row["id"]] = row
+        dispatched = []
+
+        async def capture(**kwargs):
+            dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        await adapter._replay_pending()
+
+        assert len(adapter._buzz_inflight) == cap
+        assert len(dispatched) == cap
+
+        completed_count = 0
+        while completed_count < len(rows):
+            for _ in range(20):
+                if completed_count < len(dispatched):
+                    break
+                await asyncio.sleep(0)
+            current = dispatched[completed_count]
+            source = adapter.build_source(
+                chat_id=current["chat_id"], chat_type="group", user_id=OTHER_PUBKEY,
+                message_id=current["message_id"],
+            )
+            completed = MessageEvent(
+                text="recover", source=source, message_id=current["message_id"],
+                metadata={"gateway_ingress_ack_ids": [current["message_id"]]},
+            )
+            await adapter.on_processing_complete(completed, ProcessingOutcome.SUCCESS)
+            completed_count += 1
+
+        for _ in range(20):
+            if adapter._pending_replay_task is None:
+                break
+            await asyncio.sleep(0)
+        assert len(dispatched) == len(rows)
+        assert not adapter._buzz_inflight
+        assert not any(state["pending"] for state in states.values())
+        assert adapter._pending_replay_task is None
+
+    @pytest.mark.asyncio
+    async def test_post_cursor_catchup_uses_same_global_admission_budget(self, adapter):
+        """Downtime rows first fetched from the relay cannot bypass startup replay's bound."""
+        cap = _buzz_mod._REPLAY_INFLIGHT_CAP
+        second_channel = "second-channel"
+        adapter._channel_state = {
+            CHANNEL: adapter._new_channel_state("group"),
+            second_channel: adapter._new_channel_state("group"),
+        }
+        dispatched = []
+
+        async def capture(**kwargs):
+            dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        for i in range(cap + 3):
+            channel_id = CHANNEL if i % 2 == 0 else second_channel
+            await adapter._handle_events(
+                channel_id,
+                adapter._channel_state[channel_id],
+                [_event(f"downtime-{i}", content="@Chip catch up", created_at=i + 1)],
+            )
+
+        assert len(dispatched) == cap
+        assert len(adapter._buzz_inflight) == cap
+        assert sum(len(state["pending"]) for state in adapter._channel_state.values()) == cap + 3
+        assert adapter._pending_replay_task is not None
+        adapter._pending_replay_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await adapter._pending_replay_task
+
+    @pytest.mark.asyncio
+    async def test_transport_reconnect_rearms_deferred_row(self, adapter, caplog):
+        import logging
+
+        caplog.set_level(logging.WARNING)
+        state = adapter._channel_state[CHANNEL] = adapter._new_channel_state("group")
+        state["pending"]["retry"] = _event(
+            "retry", content="@Chip retry after reconnect", created_at=200)
+        adapter._buzz_replay_deferred.add("retry")
+        dispatched = []
+
+        async def capture(**kwargs):
+            dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._resolve_user_name = AsyncMock(return_value="Researcher")
+        adapter._rearm_pending_replay("WebSocket reconnect")
+        for _ in range(20):
+            if dispatched:
+                break
+            await asyncio.sleep(0)
+
+        assert [row["message_id"] for row in dispatched] == ["retry"]
+        assert "retry" in adapter._buzz_inflight
+        assert "retry" not in adapter._buzz_replay_deferred
+        assert any("WebSocket reconnect re-armed 1 deferred event" in row.message
+                   for row in caplog.records)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("outcome", "extra_metadata"), [
+        (ProcessingOutcome.SUCCESS, {}),
+        (ProcessingOutcome.CANCELLED, {"gateway_terminal_cancel": True}),
+    ])
+    async def test_terminal_completion_settles_pending(self, adapter, outcome, extra_metadata):
+        state = adapter._channel_state[CHANNEL] = adapter._new_channel_state("group")
+        state["pending"]["e2"] = _event("e2", content="@Chip /stop", created_at=200)
+        adapter._buzz_inflight.add("e2")
+        source = adapter.build_source(
+            chat_id=CHANNEL, chat_type="group", user_id=OTHER_PUBKEY, message_id="e2")
+        event = MessageEvent(
+            text="/stop", source=source, message_id="e2",
+            metadata={"gateway_ingress_ack_ids": ["e2"], **extra_metadata},
+        )
+
+        await adapter.on_processing_complete(event, outcome)
+
+        assert "e2" not in state["pending"]
+        assert "e2" in state["seen"]
+
+    @pytest.mark.asyncio
+    async def test_shutdown_cancellation_keeps_pending_for_restart(self, adapter):
+        state = adapter._channel_state[CHANNEL] = adapter._new_channel_state("group")
+        state["pending"]["e2"] = _event("e2", content="@Chip work", created_at=200)
+        adapter._buzz_inflight.add("e2")
+        source = adapter.build_source(
+            chat_id=CHANNEL, chat_type="group", user_id=OTHER_PUBKEY, message_id="e2")
+        event = MessageEvent(
+            text="work", source=source, message_id="e2",
+            metadata={"gateway_ingress_ack_ids": ["e2"]},
+        )
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED)
+
+        assert "e2" in state["pending"]
+        assert "e2" in adapter._buzz_replay_deferred
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("response", [None, "reset complete"])
+    async def test_inline_control_or_clarify_runs_completion_hook(self, adapter, response):
+        state = adapter._channel_state[CHANNEL] = adapter._new_channel_state("group")
+        state["pending"]["inline"] = _event("inline", content="@Chip /reset", created_at=200)
+        adapter._buzz_inflight.add("inline")
+        adapter._message_handler = AsyncMock(return_value=response)
+        adapter._send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="reply"))
+        source = adapter.build_source(
+            chat_id=CHANNEL, chat_type="group", user_id=OTHER_PUBKEY, message_id="inline")
+        event = MessageEvent(
+            text="/reset", source=source, message_id="inline",
+            metadata={"gateway_ingress_ack_ids": ["inline"]},
+        )
+
+        await adapter._dispatch_inline_reply(event)
+
+        assert event._gateway_accepted is True
+        assert "inline" not in state["pending"]
+        assert "inline" in state["seen"]
+
+    @pytest.mark.asyncio
+    async def test_busy_text_debounce_settles_both_durable_buzz_rows(self, tmp_path, monkeypatch):
+        """Two Buzz events merged into one busy follow-up retain and settle both WAL receipts."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        adapter._message_handler = AsyncMock(return_value=None)
+        adapter._resolve_user_name = AsyncMock(return_value="Researcher")
+        adapter._busy_text_mode = "queue"
+        adapter._busy_text_debounce_seconds = 60.0
+        adapter._busy_text_hard_cap_seconds = 60.0
+        adapter._text_debounce = {}
+        state = adapter._channel_state[CHANNEL] = adapter._new_channel_state("group")
+        source = adapter.build_source(
+            chat_id=CHANNEL, chat_type="group", user_id=OTHER_PUBKEY, message_id="e1")
+        session_key = adapter._source_session_key(source)
+        adapter._active_sessions[session_key] = asyncio.Event()
+
+        await adapter._handle_event(
+            CHANNEL, state, _event("e1", content="@Chip first detail", created_at=100))
+        await adapter._handle_event(
+            CHANNEL, state, _event("e2", content="@Chip second detail", created_at=101))
+
+        debounced = adapter._text_debounce[session_key].event
+        assert debounced.metadata["gateway_ingress_ack_ids"] == ["e1", "e2"]
+        assert adapter._buzz_inflight == {"e1", "e2"}
+        assert list(state["pending"]) == ["e1", "e2"]
+
+        assert await adapter._flush_text_debounce_now(session_key) is True
+        merged = adapter._pending_messages.pop(session_key)
+        await adapter.on_processing_complete(merged, ProcessingOutcome.SUCCESS)
+
+        assert state["pending"] == {}
+        assert set(state["seen"]) == {"e1", "e2"}
+        assert not adapter._buzz_inflight
+        saved = json.loads(self._cursor_file(tmp_path).read_text(encoding="utf-8"))
+        assert saved["channels"][CHANNEL]["pending"] == []
+
+    def test_merged_followup_carries_every_ingress_ack(self, adapter):
+        source = adapter.build_source(chat_id=CHANNEL, chat_type="group", user_id=OTHER_PUBKEY)
+        first = MessageEvent(
+            text="one", source=source,
+            metadata={"gateway_ingress_ack_ids": ["e1"]},
+        )
+        second = MessageEvent(
+            text="two", source=source,
+            metadata={"gateway_ingress_ack_ids": ["e2"]},
+        )
+        pending = {"session": first}
+
+        merge_pending_message_event(pending, "session", second, merge_text=True)
+
+        assert pending["session"].metadata["gateway_ingress_ack_ids"] == ["e1", "e2"]
 
 
 # ── Denial / poll-failure visibility (2026-hermes-u7) ───────────────────────

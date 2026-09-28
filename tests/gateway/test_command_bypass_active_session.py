@@ -13,6 +13,7 @@ the safety net in _run_agent discards leaked command text.
 """
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -58,6 +59,7 @@ def _make_adapter():
 
     async def _mock_send_retry(chat_id, content, **kwargs):
         adapter.sent_responses.append(content)
+        return SimpleNamespace(success=True, message_id="reply")
 
     adapter._send_with_retry = _mock_send_retry
     return adapter
@@ -288,4 +290,3 @@ class TestBypassWithBotnameSuffix:
             "/stop@MyHermesBot was queued instead of bypassing"
         )
         assert any("handled:stop" in r for r in adapter.sent_responses)
-
