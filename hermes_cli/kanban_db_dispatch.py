@@ -25,6 +25,7 @@ from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from hermes_cli._launchers import installation_command
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
 if TYPE_CHECKING:
@@ -2443,9 +2444,8 @@ def _rotate_worker_log(
 
 
 def _module_hermes_argv() -> list[str]:
-    """Interpreter-bound Hermes CLI invocation (``hermes_cli.main`` is the
-    console-script target — there is no top-level ``hermes`` package)."""
-    return [sys.executable, "-m", "hermes_cli.main"]
+    """Installation-bound Hermes CLI invocation with managed dependencies."""
+    return installation_command(Path(__file__).resolve().parents[1])
 
 
 def _absolute_hermes_path(path: str) -> str:
@@ -2500,7 +2500,7 @@ def _safe_which_no_cwd(command: str) -> Optional[str]:
 def _hermes_path_argv(path: str) -> list[str]:
     """argv for a resolved Hermes executable path. Windows batch shims
     (``.cmd``/``.bat``) are unsafe as argv[0] because the argument vector
-    includes task-derived values; prefer the module form."""
+    includes task-derived values; prefer the managed installation launcher."""
     if _kb._IS_WINDOWS and _is_windows_batch_shim(path):
         return _module_hermes_argv()
     return [_absolute_hermes_path(path)]
@@ -2509,12 +2509,12 @@ def _hermes_path_argv(path: str) -> list[str]:
 def _resolve_hermes_argv() -> list[str]:
     """Resolve the ``hermes`` invocation as argv for ``Popen``: ``$HERMES_BIN``
     (path-like -> absolute; bare names keep PATH semantics, never a
-    same-directory file), then the running interpreter's ``sys.executable -m
-    hermes_cli.main`` (exactly this install; also covers shim-less cron,
-    systemd ``User=``, launchd), then ``which("hermes")`` (Windows: safe PATH
-    search, batch shims fall back to the module form) only when ``hermes_cli``
-    is not importable. The module argv must win over PATH: a PATH-first lookup
-    lets an attacker-planted ``hermes`` shadow the running install (#111569).
+    same-directory file), then this source installation's managed launcher
+    (which selects and leases its dependency generation), then
+    ``which("hermes")`` (Windows: safe PATH search, batch shims fall back to
+    the managed launcher) only when ``hermes_cli`` is not importable. The
+    installation argv must win over PATH: a PATH-first lookup lets an
+    attacker-planted ``hermes`` shadow the running install (#111569).
     Mirrors ``gateway.run._resolve_hermes_bin``; local because ``hermes_cli``
     sits below ``gateway`` in the dependency order.
     """
