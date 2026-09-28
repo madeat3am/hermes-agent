@@ -3671,6 +3671,56 @@ class TestChannelCursorPersistence:
         adapter._dispatch_message.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_poll_failure_rearms_once_without_duplicate_dispatch(self, adapter):
+        state = adapter._channel_state[CHANNEL] = adapter._new_channel_state("group")
+        raw = _event("retry", content="@Chip retry", created_at=200)
+        state["pending"]["retry"] = raw
+        adapter._buzz_inflight.add("retry")
+        adapter._poll_replay_retry_delay = 0
+        adapter._poll_task = asyncio.create_task(asyncio.Event().wait())
+        dispatched = []
+
+        async def capture(**kwargs):
+            dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._resolve_user_name = AsyncMock(return_value="Researcher")
+        source = adapter.build_source(
+            chat_id=CHANNEL, chat_type="group", user_id=OTHER_PUBKEY, message_id="retry")
+        event = MessageEvent(
+            text="retry", source=source, message_id="retry",
+            metadata={"gateway_ingress_ack_ids": ["retry"]},
+        )
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+        retry_task = adapter._poll_replay_retry_task
+        # A repeated failure callback coalesces behind the same retry epoch.
+        await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+        assert adapter._poll_replay_retry_task is retry_task
+        for _ in range(20):
+            if dispatched:
+                break
+            await asyncio.sleep(0)
+        # An inclusive poll racing the retry observes the in-flight claim.
+        await adapter._handle_event(CHANNEL, state, raw)
+
+        assert [row["message_id"] for row in dispatched] == ["retry"]
+        assert "retry" in adapter._buzz_inflight
+        await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_cancels_poll_replay_retry(self, adapter):
+        adapter._poll_task = asyncio.create_task(asyncio.Event().wait())
+        adapter._poll_replay_retry_delay = 60
+        adapter._schedule_poll_replay_retry()
+        retry_task = adapter._poll_replay_retry_task
+
+        await adapter.disconnect()
+
+        assert retry_task is not None and retry_task.cancelled()
+        assert adapter._poll_replay_retry_task is None
+
+    @pytest.mark.asyncio
     async def test_load_never_truncates_pending_wal_above_live_cap(self, adapter, tmp_path):
         cap = _buzz_mod._PENDING_CAP
         rows = [_event(f"pending-{i}", content="@Chip recover", created_at=i) for i in range(cap + 1)]

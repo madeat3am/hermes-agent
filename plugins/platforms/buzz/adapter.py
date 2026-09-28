@@ -103,6 +103,7 @@ _CURSOR_STATE_FILENAME = "channel-cursors.json"
 _DM_DISCOVERY_EVERY = 5  # re-run DM discovery every N poll sweeps
 _DEFAULT_POLL_INTERVAL = 4.0
 _MIN_POLL_INTERVAL = 1.0
+_POLL_REPLAY_RETRY_MAX = 30.0  # cap failed-turn WAL re-arm backoff
 _CLI_TIMEOUT = 30.0
 # Mention-resolution caches: member lists are hit on every publish containing "@"; names must not outlive a rename.
 _MEMBER_CACHE_TTL = 60.0
@@ -582,6 +583,8 @@ class BuzzAdapter(BasePlatformAdapter):
         self._buzz_replay_deferred: set[str] = set()
         self._pending_replay_wake = asyncio.Event()
         self._pending_replay_task: Optional[asyncio.Task] = None
+        self._poll_replay_retry_task: Optional[asyncio.Task] = None
+        self._poll_replay_retry_delay = min(self.poll_interval, _POLL_REPLAY_RETRY_MAX)
         # Orders off-loop cursor writes: each snapshot is taken under it, so an older one never lands last.
         self._cursor_write_lock = asyncio.Lock()
         self._channel_names: Dict[str, str] = {}
@@ -731,6 +734,8 @@ class BuzzAdapter(BasePlatformAdapter):
         self._ws_task = None
         await cancel_task(self._poll_task)
         self._poll_task = None
+        await cancel_task(self._poll_replay_retry_task)
+        self._poll_replay_retry_task = None
         await cancel_task(self._pending_replay_task)
         self._pending_replay_task = None
         self._channel_state = {}
@@ -738,6 +743,7 @@ class BuzzAdapter(BasePlatformAdapter):
         self._buzz_replay_deferred.clear()
         self._pending_replay_wake.clear()
         self._poll_count = 0
+        self._poll_replay_retry_delay = min(self.poll_interval, _POLL_REPLAY_RETRY_MAX)
 
     # ── Sending ───────────────────────────────────────────────────────────
 
@@ -1705,6 +1711,35 @@ class BuzzAdapter(BasePlatformAdapter):
             self._ensure_pending_replay_task()
             self._pending_replay_wake.set()
 
+    def _schedule_poll_replay_retry(self) -> None:
+        """Re-arm failed durable inbox rows once after bounded poll backoff.
+
+        WebSocket failures keep their reconnect epoch: only a live poll task
+        owns this timer.  Coalescing failures behind one timer prevents an
+        inclusive relay poll and repeated completion hooks from dispatching
+        the same saved row twice.  This retries ingress processing only; the
+        delivery ledger still fences an outbound send with an ambiguous result.
+        """
+        if self._poll_task is None or self._poll_task.done():
+            return
+        if self._poll_replay_retry_task is not None and not self._poll_replay_retry_task.done():
+            return
+        delay = max(0.0, min(self._poll_replay_retry_delay, _POLL_REPLAY_RETRY_MAX))
+        self._poll_replay_retry_delay = min(
+            max(self.poll_interval, delay * 2), _POLL_REPLAY_RETRY_MAX)
+
+        async def _retry() -> None:
+            current = asyncio.current_task()
+            try:
+                await asyncio.sleep(delay)
+                if self._poll_task is not None and not self._poll_task.done():
+                    self._rearm_pending_replay("poll processing retry")
+            finally:
+                if self._poll_replay_retry_task is current:
+                    self._poll_replay_retry_task = None
+
+        self._poll_replay_retry_task = asyncio.create_task(_retry())
+
     async def _replay_pending(self) -> None:
         """Admit a bounded startup tranche and arrange eventual drain of the saved backlog."""
         total = sum(len(state.get("pending") or {}) for state in self._channel_state.values())
@@ -2128,6 +2163,7 @@ class BuzzAdapter(BasePlatformAdapter):
             self._buzz_inflight.difference_update(event_ids)
             self._buzz_replay_deferred.update(event_ids)
             self._pending_replay_wake.set()
+            self._schedule_poll_replay_retry()
             return
         channel_id = str(getattr(event.source, "chat_id", "") or "")
         state = self._channel_state.get(channel_id)
@@ -2141,6 +2177,7 @@ class BuzzAdapter(BasePlatformAdapter):
             state.setdefault("pending", OrderedDict()).pop(event_id, None)
             state["seen"][event_id] = None
             self._buzz_inflight.discard(event_id)
+        self._poll_replay_retry_delay = min(self.poll_interval, _POLL_REPLAY_RETRY_MAX)
         self._trim_seen(state)
         await self._persist_cursors()
         self._pending_replay_wake.set()
