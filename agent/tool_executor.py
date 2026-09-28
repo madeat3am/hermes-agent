@@ -1670,6 +1670,15 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
     def _execute(next_args: dict) -> Any:
         import model_tools
 
+        runtime_route = {}
+        if function_name == "kanban_review_binding":
+            # Bind identity to the route that produced this tool call. A normal
+            # one-tool turn uses this sequential dispatcher, while batched calls
+            # use agent_runtime_helpers.invoke_tool.
+            runtime_route = {
+                "runtime_provider": str(getattr(agent, "provider", "") or ""),
+                "runtime_model": str(getattr(agent, "model", "") or ""),
+            }
         with model_tools.suppress_post_tool_call_hook():
             return model_tools.handle_function_call(
                 function_name,
@@ -1686,6 +1695,7 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
                 tool_request_middleware_trace=list(middleware_trace),
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                **runtime_route,
             )
 
     return _SequentialDispatch(

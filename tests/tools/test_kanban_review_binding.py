@@ -138,3 +138,32 @@ def test_agent_dispatch_injects_active_route(monkeypatch):
     ) == "ok"
     assert captured["kwargs"]["runtime_provider"] == "openai-codex"
     assert captured["kwargs"]["runtime_model"] == "gpt-6-astra"
+
+
+def test_native_sequential_dispatch_binds_active_route(review_worker):
+    from agent.tool_executor import _ToolCallRef, _resolve_sequential_dispatch
+
+    agent = SimpleNamespace(
+        _context_engine_tool_names=set(),
+        _memory_manager=None,
+        session_id="session-1",
+        valid_tool_names=["kanban_review_binding"],
+        enabled_toolsets=["kanban"],
+        disabled_toolsets=[],
+        provider="xai-oauth",
+        model="grok-4.7",
+        quiet_mode=False,
+    )
+    ref = _ToolCallRef(
+        name="kanban_review_binding",
+        args={},
+        task_id=review_worker.task_id,
+        call_id="call-1",
+        trace=[],
+    )
+
+    result = json.loads(_resolve_sequential_dispatch(agent, ref, []).execute({}))
+
+    assert result["ok"] is True
+    assert result["binding"]["reviewer_provider"] == "xai-oauth"
+    assert result["binding"]["reviewer_model"] == "grok-4.7"
