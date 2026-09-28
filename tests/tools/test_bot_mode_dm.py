@@ -20,7 +20,12 @@ from tools import bot_mode_dm, bot_mode_probe, bot_relay
 
 
 @pytest.fixture(autouse=True)
-def _fresh_probe_cache():
+def _fresh_probe_cache(tmp_path, monkeypatch):
+    # The installed checkout has a real payload manifest beside it. Keep
+    # launcher resolution inside the test's isolated runtime directory.
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    monkeypatch.setenv("HERMES_RUNTIME_DIR", str(runtime))
     bot_mode_probe._reset_cache_for_tests()
     yield
     bot_mode_probe._reset_cache_for_tests()
