@@ -7,6 +7,7 @@ lifecycle as wired into BuzzAdapter.
 """
 
 import asyncio
+import hashlib
 import inspect
 import json
 import time
@@ -799,6 +800,98 @@ async def test_ws_discovery_task_cancelled_when_connection_exits(monkeypatch):
 
     assert started, "discovery task was never started with the connection"
     assert all(t.done() for t in started), "discovery task outlived its connection"
+
+
+# ── Presence lease on the authenticated adapter socket ─────────────────────
+
+
+def test_presence_event_is_signed_kind_20001(monkeypatch):
+    adapter = _make_adapter()
+    created_at = 1_700_000_000
+    monkeypatch.setattr(_buzz_mod.time, "time", lambda: created_at)
+
+    event = adapter._presence_event(TEST_PRIVATE_KEY)
+    serialized = json.dumps(
+        [0, event["pubkey"], created_at, 20001, [["status", "online"]], "online"],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+    assert event == {
+        "id": hashlib.sha256(serialized.encode()).hexdigest(),
+        "pubkey": nostr_auth.public_key_hex(TEST_PRIVATE_KEY),
+        "created_at": created_at,
+        "kind": 20001,
+        "tags": [["status", "online"]],
+        "content": "online",
+        "sig": event["sig"],
+    }
+    assert len(bytes.fromhex(event["sig"])) == 64
+
+
+@pytest.mark.asyncio
+async def test_presence_heartbeat_retries_on_same_socket_without_ending_reader(monkeypatch, caplog):
+    adapter = _make_adapter()
+    event = {"id": "presence", "kind": 20001}
+    monkeypatch.setattr(adapter, "_presence_event", lambda *_: event)
+
+    class _PresenceSocket:
+        def __init__(self):
+            self.calls = 0
+            self.sent = []
+
+        async def send(self, raw):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("temporary send failure")
+            self.sent.append(json.loads(raw))
+
+    sleep_calls = 0
+
+    async def stop_after_retry(delay):
+        nonlocal sleep_calls
+        assert delay == adapter._PRESENCE_HEARTBEAT_SECS
+        sleep_calls += 1
+        if sleep_calls == 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "sleep", stop_after_retry)
+    websocket = _PresenceSocket()
+
+    with pytest.raises(asyncio.CancelledError):
+        await adapter._presence_on_socket(websocket)
+
+    assert websocket.calls == 2
+    assert websocket.sent == [["EVENT", event]]
+    assert sum("presence heartbeat failed" in record.message for record in caplog.records) == 1
+
+
+@pytest.mark.asyncio
+async def test_presence_heartbeat_is_cancelled_when_socket_reader_exits(monkeypatch):
+    adapter = _make_adapter()
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def presence(websocket):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    async def reader(websocket, subscriptions):
+        await started.wait()
+        raise RuntimeError("reader stopped")
+
+    monkeypatch.setattr(adapter, "_presence_on_socket", presence)
+    monkeypatch.setattr(adapter, "_ws_read_loop_frames", reader)
+
+    with pytest.raises(RuntimeError, match="reader stopped"):
+        await adapter._ws_read_loop(object(), {})
+    await asyncio.sleep(0)
+
+    assert cancelled.is_set(), "presence heartbeat outlived its authenticated socket reader"
 
 
 # ── Frame-aware watchdog (#98097 + 2026-hermes-u7) ──────────────────────────

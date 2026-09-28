@@ -1203,7 +1203,58 @@ class BuzzAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             return None
 
+    # ── Presence lease over the live socket (citadel-buzz-presence-lease-v2) ─
+    # Buzz presence is a 180s lease renewed by a 60s kind:20001 heartbeat that the relay accepts only
+    # over a WebSocket.  Publishing on this authenticated adapter socket ties presence to real
+    # liveness and avoids opening a second connection whose close can clear the same principal's lease.
+    _PRESENCE_HEARTBEAT_SECS = 60.0
+
+    @staticmethod
+    def _presence_event(private_key: str, status: str = "online") -> Dict[str, Any]:
+        tags = [["status", status]]
+        pubkey = _nostr_auth.public_key_hex(private_key)
+        created_at = int(time.time())
+        serialized = json.dumps(
+            [0, pubkey, created_at, 20001, tags, status],
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        event_id = hashlib.sha256(serialized.encode()).digest()
+        return {
+            "id": event_id.hex(),
+            "pubkey": pubkey,
+            "created_at": created_at,
+            "kind": 20001,
+            "tags": tags,
+            "content": status,
+            "sig": _nostr_auth.schnorr_sign(event_id, private_key).hex(),
+        }
+
+    async def _presence_on_socket(self, websocket) -> None:
+        warned = False
+        while True:
+            try:
+                # Pure-Python Schnorr signing takes measurable CPU time; keep it off the event loop.
+                event = await asyncio.to_thread(self._presence_event, self._private_key)
+                await websocket.send(json.dumps(["EVENT", event], separators=(",", ":")))
+                warned = False
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Presence is advisory: a heartbeat failure must not tear down inbound delivery.
+                if not warned:
+                    logger.warning("Buzz: presence heartbeat failed — %s", exc)
+                    warned = True
+            await asyncio.sleep(self._PRESENCE_HEARTBEAT_SECS)
+
     async def _ws_read_loop(self, websocket, subscriptions: Dict[str, Optional[str]]) -> None:
+        heartbeat = asyncio.create_task(self._presence_on_socket(websocket))
+        try:
+            await self._ws_read_loop_frames(websocket, subscriptions)
+        finally:
+            heartbeat.cancel()
+
+    async def _ws_read_loop_frames(self, websocket, subscriptions: Dict[str, Optional[str]]) -> None:
         """Read frames until the relay closes; a liveness-stalled read raises ConnectionError to reconnect.
 
         Frame-aware: data frames (EVENT / CLOSED / NOTICE) prove activity directly, but an otherwise
