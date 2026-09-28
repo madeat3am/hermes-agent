@@ -63,6 +63,7 @@ _ENV_VARS = (
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch, tmp_path):
     """Keep tests hermetic: no ambient Buzz env vars or real credentials."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
     for var in _ENV_VARS:
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(_buzz_mod, "_DEFAULT_CREDENTIALS_DIR", tmp_path / "no-creds")
