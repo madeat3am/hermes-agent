@@ -65,7 +65,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter, CachedMedia, SendResult, cache_media_bytes_async,
 )
 from gateway.platforms.helpers import cancel_task
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.config import Platform
 
 
@@ -96,6 +96,8 @@ def _escape_unresolved_presentation_mention(content: str, error: str) -> Optiona
 
 _FETCH_LIMIT = 50  # events per poll / seed call
 _SEEN_CAP = 500  # per-channel de-dupe set bound (events)
+_PENDING_CAP = 500  # durable, unacknowledged inbound events per channel
+_REPLAY_INFLIGHT_CAP = 16  # process-wide startup replay admissions; completions release slots
 _CURSOR_STATE_SUBDIR = "buzz"  # per-channel cursors survive a restart under HERMES_HOME
 _CURSOR_STATE_FILENAME = "channel-cursors.json"
 _DM_DISCOVERY_EVERY = 5  # re-run DM discovery every N poll sweeps
@@ -569,6 +571,17 @@ class BuzzAdapter(BasePlatformAdapter):
         self._channel_state: Dict[str, dict] = {}
         # Cursors read from disk at connect(), consumed by each channel's first seed.
         self._restored_cursors: Dict[str, dict] = {}
+        # Event ids admitted to the gateway but not yet completed.  The durable
+        # copy lives in each channel state's ``pending`` map; this process-local
+        # set prevents an inclusive relay cursor from dispatching one twice.
+        self._buzz_inflight: set[str] = set()
+        # A restart may restore more than one channel's bounded live-admission
+        # capacity.  Replay uses one process-wide lane so recovery cannot spawn
+        # every saved request at once.  Failed requests are deferred until the
+        # next reconnect while the rest of the saved backlog continues draining.
+        self._buzz_replay_deferred: set[str] = set()
+        self._pending_replay_wake = asyncio.Event()
+        self._pending_replay_task: Optional[asyncio.Task] = None
         # Orders off-loop cursor writes: each snapshot is taken under it, so an older one never lands last.
         self._cursor_write_lock = asyncio.Lock()
         self._channel_names: Dict[str, str] = {}
@@ -683,6 +696,10 @@ class BuzzAdapter(BasePlatformAdapter):
             await self._seed_channel(channel_id, chat_type="group")
         await self._discover_dms(seed=True)
         self._save_cursors()
+        # A persisted pending event was admitted before a prior process died.
+        # Admit one globally bounded tranche before opening the live transport,
+        # then let completions wake the background drain for the remainder.
+        await self._replay_pending()
         # Prefer the NIP-42 WebSocket push; poll when it can't be established (auto) or the user pinned "poll".
         transport_used = "poll"
         if self.transport in ("auto", "websocket"):
@@ -714,7 +731,12 @@ class BuzzAdapter(BasePlatformAdapter):
         self._ws_task = None
         await cancel_task(self._poll_task)
         self._poll_task = None
+        await cancel_task(self._pending_replay_task)
+        self._pending_replay_task = None
         self._channel_state = {}
+        self._buzz_inflight.clear()
+        self._buzz_replay_deferred.clear()
+        self._pending_replay_wake.clear()
         self._poll_count = 0
 
     # ── Sending ───────────────────────────────────────────────────────────
@@ -1126,6 +1148,10 @@ class BuzzAdapter(BasePlatformAdapter):
                     if self._ws_ready is not None:
                         self._ws_ready.set()
                     if reconnecting:
+                        # A transport reconnect is the next safe retry epoch:
+                        # re-arm rows deferred after a processing/admission
+                        # failure and wake the bounded durable-inbox drain.
+                        self._rearm_pending_replay("WebSocket reconnect")
                         # connect() published "connected" once; a recovered socket has to say so again.
                         reconnecting = False
                         self._mark_connected()
@@ -1286,7 +1312,13 @@ class BuzzAdapter(BasePlatformAdapter):
                 logger.warning("Buzz: poll sweep failed", exc_info=True)
 
     def _new_channel_state(self, chat_type: str) -> dict:
-        return {"chat_type": chat_type, "last_ts": 0, "seen": OrderedDict(), "event_meta": OrderedDict()}
+        return {
+            "chat_type": chat_type,
+            "last_ts": 0,
+            "seen": OrderedDict(),
+            "pending": OrderedDict(),
+            "event_meta": OrderedDict(),
+        }
 
     # ── Durable channel cursors ───────────────────────────────────────────
 
@@ -1318,7 +1350,30 @@ class BuzzAdapter(BasePlatformAdapter):
                 continue
             raw_seen = entry.get("seen")
             seen = [str(event_id) for event_id in raw_seen][-_SEEN_CAP:] if isinstance(raw_seen, list) else []
-            self._restored_cursors[str(channel_id)] = {"chat_type": str(entry.get("chat_type") or ""), "last_ts": last_ts, "seen": seen}
+            raw_pending = entry.get("pending")
+            pending: "OrderedDict[str, dict]" = OrderedDict()
+            if isinstance(raw_pending, list):
+                # Never truncate a previously admitted WAL.  _PENDING_CAP is a
+                # live-admission brake; applying it while loading would rewrite
+                # the file without its tail on the next save and silently lose
+                # every request beyond the cap.
+                for raw_event in raw_pending:
+                    if isinstance(raw_event, dict) and (event_id := str(raw_event.get("id") or "")):
+                        pending[event_id] = raw_event
+                if len(raw_pending) > _PENDING_CAP:
+                    logger.warning(
+                        "Buzz: channel %s restored %d pending events above the %d-event live-admission cap",
+                        channel_id, len(raw_pending), _PENDING_CAP,
+                    )
+            # Pending is authoritative over a stale seen entry: an unacknowledged
+            # request must replay after a crash.
+            seen = [event_id for event_id in seen if event_id not in pending]
+            self._restored_cursors[str(channel_id)] = {
+                "chat_type": str(entry.get("chat_type") or ""),
+                "last_ts": last_ts,
+                "seen": seen,
+                "pending": pending,
+            }
         # Durably restore permanently-rejected ("restricted") channels so a restart does not re-seed
         # them and reconnect-loop; re-granted access requires clearing the entry from the cursor file.
         raw_restricted = data.get("restricted")
@@ -1331,6 +1386,7 @@ class BuzzAdapter(BasePlatformAdapter):
             channel_id: {
                 "chat_type": state.get("chat_type") or "group", "last_ts": int(state.get("last_ts") or 0),
                 "seen": list(state.get("seen") or ()),
+                "pending": list((state.get("pending") or {}).values()),
             }
             for channel_id, state in self._channel_state.items()
         }
@@ -1345,18 +1401,33 @@ class BuzzAdapter(BasePlatformAdapter):
         self._write_cursors(self._cursor_path(), self._cursor_payload())
 
     @staticmethod
-    def _write_cursors(path: Path, payload: dict) -> None:
+    def _write_cursors(path: Path, payload: dict) -> bool:
         try:
             from utils import atomic_json_write
             atomic_json_write(path, payload, indent=None)
+            return True
         except Exception:
             logger.warning("Buzz: could not persist channel cursors", exc_info=True)
+            return False
+
+    async def _persist_cursors(self) -> bool:
+        """Serialize the current cursor snapshot in write order, off the loop."""
+        async with self._cursor_write_lock:
+            return await asyncio.to_thread(
+                self._write_cursors, self._cursor_path(), self._cursor_payload())
 
     @staticmethod
     def _cursor_mark(state: dict) -> tuple:
         """Cheap change detector for one channel's cursor."""
         seen = state.get("seen") or ()
-        return int(state.get("last_ts") or 0), len(seen), (next(reversed(seen), None) if seen else None)
+        pending = state.get("pending") or ()
+        return (
+            int(state.get("last_ts") or 0),
+            len(seen),
+            next(reversed(seen), None) if seen else None,
+            len(pending),
+            next(reversed(pending), None) if pending else None,
+        )
 
     def _restore_channel_state(self, channel_id: str, chat_type: str) -> bool:
         """Install a persisted cursor (True when one existed): seeding would mark downtime arrivals as seen.
@@ -1371,6 +1442,7 @@ class BuzzAdapter(BasePlatformAdapter):
         state = self._new_channel_state(restored["chat_type"] or chat_type)
         state["last_ts"] = restored["last_ts"]
         state["seen"] = OrderedDict((event_id, None) for event_id in restored["seen"])
+        state["pending"] = OrderedDict(restored.get("pending") or ())
         self._channel_state[channel_id] = state
         return True
 
@@ -1460,7 +1532,8 @@ class BuzzAdapter(BasePlatformAdapter):
         """Handle a batch, trim, and persist only when the cursor moved (idle channels don't rewrite the file)."""
         before = self._cursor_mark(state)
         for event in events:
-            await self._handle_event(channel_id, state, event)
+            if not await self._handle_event(channel_id, state, event):
+                break
         self._trim_seen(state)
         if self._cursor_mark(state) != before:
             # The write fsyncs + renames, and on the WebSocket transport this runs once per inbound event.
@@ -1568,26 +1641,120 @@ class BuzzAdapter(BasePlatformAdapter):
     async def _cache_inbound_attachments(self, metadata_items: List[dict]) -> List[CachedMedia]:
         return [a for m in metadata_items if (a := await self._download_attachment(m)) is not None]
 
-    async def _handle_event(self, channel_id: str, state: dict, event: dict) -> None:
-        """De-dupe, filter, and dispatch a single ``messages get`` event."""
+    async def _finish_without_turn(
+        self, channel_id: str, state: dict, event_id: str, created_at: int, *, was_pending: bool,
+    ) -> bool:
+        """Commit a filtered event; a restored pending row is removed durably."""
+        pending = state.setdefault("pending", OrderedDict())
+        if was_pending:
+            pending.pop(event_id, None)
+            self._buzz_inflight.discard(event_id)
+        state["seen"][event_id] = None
+        state["last_ts"] = max(state["last_ts"], created_at)
+        self._trim_seen(state)
+        return not was_pending or await self._persist_cursors()
+
+    def _replayable_pending(self) -> list[tuple[str, dict, dict]]:
+        """Snapshot saved rows which are neither running nor deferred this process."""
+        rows: list[tuple[str, dict, dict]] = []
+        for channel_id, state in self._channel_state.items():
+            for event_id, raw_event in (state.get("pending") or {}).items():
+                if event_id not in self._buzz_inflight and event_id not in self._buzz_replay_deferred:
+                    rows.append((channel_id, state, raw_event))
+        return rows
+
+    async def _drain_pending_replay_once(self) -> bool:
+        """Fill the global replay lane once; return whether replayable rows remain."""
+        for channel_id, state, raw_event in self._replayable_pending():
+            if len(self._buzz_inflight) >= _REPLAY_INFLIGHT_CAP:
+                return True
+            event_id = str(raw_event.get("id") or "")
+            await self._handle_event(channel_id, state, raw_event, replay=True)
+            # An admission refusal must not spin on one poison row.  Keep it
+            # durable for the next reconnect and continue draining other rows.
+            if event_id and event_id in (state.get("pending") or {}) and event_id not in self._buzz_inflight:
+                self._buzz_replay_deferred.add(event_id)
+        return bool(self._replayable_pending())
+
+    async def _pending_replay_loop(self) -> None:
+        """Drain saved requests as successful/terminal completions free global replay slots."""
+        try:
+            while True:
+                self._pending_replay_wake.clear()
+                if not await self._drain_pending_replay_once():
+                    return
+                await self._pending_replay_wake.wait()
+        finally:
+            if self._pending_replay_task is asyncio.current_task():
+                self._pending_replay_task = None
+
+    def _ensure_pending_replay_task(self) -> None:
+        """Ensure one drain worker owns queued durable rows."""
+        if self._pending_replay_task is None or self._pending_replay_task.done():
+            self._pending_replay_task = asyncio.create_task(self._pending_replay_loop())
+
+    def _rearm_pending_replay(self, reason: str) -> None:
+        """Start a new retry epoch after transport recovery."""
+        deferred = len(self._buzz_replay_deferred)
+        self._buzz_replay_deferred.clear()
+        if self._replayable_pending():
+            logger.warning(
+                "Buzz: %s re-armed %d deferred event(s); resuming bounded inbound recovery",
+                reason, deferred,
+            )
+            self._ensure_pending_replay_task()
+            self._pending_replay_wake.set()
+
+    async def _replay_pending(self) -> None:
+        """Admit a bounded startup tranche and arrange eventual drain of the saved backlog."""
+        total = sum(len(state.get("pending") or {}) for state in self._channel_state.values())
+        if total:
+            logger.warning("Buzz: recovering %d unacknowledged inbound event(s)", total)
+        if not await self._drain_pending_replay_once():
+            return
+        self._ensure_pending_replay_task()
+
+    async def _handle_event(
+        self, channel_id: str, state: dict, event: dict, *, replay: bool = False,
+    ) -> bool:
+        """De-dupe, durably admit, and dispatch one ``messages get`` event.
+
+        Returns False only when the durable inbox could not accept the event;
+        callers stop the batch so no later cursor can advance past it.
+        """
         event_id = str(event.get("id") or "")
         created_at = int(event.get("created_at") or 0)
         if not event_id or event_id in state["seen"]:
-            return
-        state["seen"][event_id] = None
-        state["last_ts"] = max(state["last_ts"], created_at)
+            return True
+        pending = state.setdefault("pending", OrderedDict())
+        was_pending = event_id in pending
+        if was_pending:
+            event = pending[event_id]
+            created_at = int(event.get("created_at") or 0)
+            if event_id in self._buzz_inflight:
+                return True
+            if event_id in self._buzz_replay_deferred:
+                return True
+            # Inclusive relay polling can encounter a restored row before the
+            # replay worker reaches it.  Keep the process-wide startup bound.
+            if not replay and len(self._buzz_inflight) >= _REPLAY_INFLIGHT_CAP:
+                self._pending_replay_wake.set()
+                return True
         if int(event.get("kind") or 0) not in _DISPATCH_KINDS:
-            return
+            return await self._finish_without_turn(
+                channel_id, state, event_id, created_at, was_pending=was_pending)
         pubkey = str(event.get("pubkey") or "").lower()
         content = event.get("content")
         attachment_metadata, rejected_attachments = self._parse_imeta_attachments(event)
         if not pubkey or not isinstance(content, str) or not (content.strip() or attachment_metadata or rejected_attachments):
-            return
+            return await self._finish_without_turn(
+                channel_id, state, event_id, created_at, was_pending=was_pending)
         # Cache before any early return so self-echo and concurrent-author traffic can still be reply parents.
         self._remember_event(state, event)
         # See #75826.
         if pubkey == self._self_pubkey:
-            return
+            return await self._finish_without_turn(
+                channel_id, state, event_id, created_at, was_pending=was_pending)
         # Reclassify a leaked DM before gating so its first un-mentioned message both latches and dispatches.
         self._maybe_latch_dm(channel_id, state, event)
         is_dm = state["chat_type"] == "dm"
@@ -1597,13 +1764,44 @@ class BuzzAdapter(BasePlatformAdapter):
         # Channels dispatch only when addressed (@mention or p-tag) or replying to us (Signal/WhatsApp parity),
         # unless require_mention is off. DMs always dispatch.
         if not is_dm and self.require_mention and not self._is_addressed(event) and not reply_to_is_own:
-            return
+            return await self._finish_without_turn(
+                channel_id, state, event_id, created_at, was_pending=was_pending)
         # Adapter-level allow-list (gateway also applies it centrally); empty = no filter.
         if self._allowed_pubkeys and pubkey not in self._allowed_pubkeys:
             if pubkey in self._reaction_only_pubkeys and _p_tagged(event, self._self_pubkey) and self._is_mentioned(content):
                 await self.send_reaction(channel_id, event_id, "👀")
             logger.warning("Buzz: ignoring message from unauthorized pubkey %s…", pubkey[:8])
-            return
+            return await self._finish_without_turn(
+                channel_id, state, event_id, created_at, was_pending=was_pending)
+        if not was_pending:
+            if len(pending) >= _PENDING_CAP:
+                logger.error(
+                    "Buzz: durable inbound queue full for channel %s (%d events); cursor not advanced",
+                    channel_id, _PENDING_CAP,
+                )
+                return False
+            previous_last_ts = state["last_ts"]
+            pending[event_id] = event
+            state["last_ts"] = max(previous_last_ts, created_at)
+            # This is the admission WAL: a crash anywhere after this write
+            # replays the exact relay event instead of trusting the advanced cursor.
+            # Vendor-native checked (2026-09-27): gateway/run_inbound.py creates
+            # its durable active-turn marker only after the background turn starts,
+            # and the delivery ledger begins after a reply exists.  Neither owns
+            # the crash window between transport admission and active-turn start;
+            # this adapter WAL closes that earlier gap without duplicating either.
+            if not await self._persist_cursors():
+                pending.pop(event_id, None)
+                state["last_ts"] = previous_last_ts
+                logger.error("Buzz: refusing volatile admission for event %s", event_id[:12])
+                return False
+            # Events first discovered after restoring a saved cursor are also
+            # catch-up work.  Persist all of them before advancing the cursor,
+            # but admit no more than the same process-wide replay budget.
+            if len(self._buzz_inflight) >= _REPLAY_INFLIGHT_CAP:
+                self._ensure_pending_replay_task()
+                self._pending_replay_wake.set()
+                return True
         # Strip a leading @mention (DMs often open with one too) so "@Chip /whoami" is recognized as a command.
         dispatch_text = self._strip_mention(content)
         # NIP-10 root scopes the session; remember it so our reply joins the SAME thread instead of nesting.
@@ -1613,7 +1811,15 @@ class BuzzAdapter(BasePlatformAdapter):
         # The message still dispatches so GatewayRunner can apply denial/pairing.
         chat_type = "dm" if is_dm else "group"
         fetch_allowed = bool(attachment_metadata) and self._is_sender_authorized(pubkey, chat_type, channel_id) is True
-        attachments = await self._cache_inbound_attachments(attachment_metadata) if fetch_allowed else []
+        # Claim before the first post-admission await.  Startup replay and the
+        # live inclusive relay stream can otherwise both pass the earlier
+        # de-dupe check and dispatch the same saved row.
+        self._buzz_inflight.add(event_id)
+        try:
+            attachments = await self._cache_inbound_attachments(attachment_metadata) if fetch_allowed else []
+        except BaseException:
+            self._buzz_inflight.discard(event_id)
+            raise
         if rejected_attachments:
             dispatch_text = f"{dispatch_text}\n{self._attachment_rejection_note(rejected_attachments)}".strip()
         if fetch_allowed and (failed := len(attachment_metadata) - len(attachments)):
@@ -1623,14 +1829,24 @@ class BuzzAdapter(BasePlatformAdapter):
             # Mixed kinds use document semantics so an audio member is not mistaken for a voice note (STT).
             kinds = {attachment.kind for attachment in attachments}
             message_type = _ATTACHMENT_KIND_TYPES.get(next(iter(kinds)), MessageType.DOCUMENT) if len(kinds) == 1 else MessageType.DOCUMENT
-        await self._dispatch_message(
-            text=dispatch_text, chat_id=channel_id, chat_type=chat_type, user_id=pubkey,
-            user_name=await self._resolve_user_name(pubkey), message_id=event_id,
-            created_at=created_at, thread_id=thread_id, reply_to_message_id=reply_parent_id,
-            reply_to_text=reply_meta[1] if reply_meta else None, reply_to_author_id=reply_meta[0] if reply_meta else None,
-            reply_to_is_own_message=reply_to_is_own, media_urls=[attachment.path for attachment in attachments],
-            media_types=[attachment.media_type for attachment in attachments], message_type=message_type, raw_message=event,
-        )
+        try:
+            user_name = await self._resolve_user_name(pubkey)
+            accepted = await self._dispatch_message(
+                text=dispatch_text, chat_id=channel_id, chat_type=chat_type, user_id=pubkey,
+                user_name=user_name, message_id=event_id,
+                created_at=created_at, thread_id=thread_id, reply_to_message_id=reply_parent_id,
+                reply_to_text=reply_meta[1] if reply_meta else None, reply_to_author_id=reply_meta[0] if reply_meta else None,
+                reply_to_is_own_message=reply_to_is_own, media_urls=[attachment.path for attachment in attachments],
+                media_types=[attachment.media_type for attachment in attachments], message_type=message_type, raw_message=event,
+                ingress_ack_ids=[event_id],
+            )
+        except BaseException:
+            self._buzz_inflight.discard(event_id)
+            raise
+        if accepted is False:
+            self._buzz_inflight.discard(event_id)
+            self._buzz_replay_deferred.add(event_id)
+        return True
 
     # ── DM classification: DMs leak in via ``channels list`` as "group"; a real channel's p-tag is only addressing ──
 
@@ -1850,10 +2066,11 @@ class BuzzAdapter(BasePlatformAdapter):
         reply_to_author_id: Optional[str] = None, reply_to_is_own_message: bool = False,
         media_urls: Optional[List[str]] = None, media_types: Optional[List[str]] = None,
         message_type: MessageType = MessageType.TEXT, raw_message: Any = None,
-    ) -> None:
+        ingress_ack_ids: Optional[List[str]] = None,
+    ) -> bool:
         """Build a MessageEvent and hand it to the base class handler."""
         if not self._message_handler:
-            return
+            return False
         media_urls = list(media_urls or [])
         media_types = list(media_types or [])
         # Same-relay URL refs are localized in addition to the caller's imeta attachments (both explicit-True gated).
@@ -1878,13 +2095,55 @@ class BuzzAdapter(BasePlatformAdapter):
             timestamp=datetime.fromtimestamp(created_at) if created_at else datetime.now(),
             reply_to_message_id=reply_to_message_id, reply_to_text=reply_to_text,
             reply_to_author_id=reply_to_author_id, reply_to_is_own_message=reply_to_is_own_message,
+            metadata={"gateway_ingress_ack_ids": list(ingress_ack_ids or [])},
         )
         await self.handle_message(event)
+        if not event._gateway_accepted:
+            return False
         # "Seen" reaction: signals the message was received and is being processed.
         try:
             await self.send_reaction(chat_id, message_id, "👀")
         except Exception:
             logger.warning("Buzz: reaction failed for message %s", message_id[:12], exc_info=True)
+        return True
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        """Acknowledge the durable Buzz inbox after success or an intentional cancellation.
+
+        Failure, shutdown cancellation, or process death leaves the event
+        pending, so a later gateway start replays it.  A ``CANCELLED`` carrying
+        ``gateway_terminal_cancel`` came from /stop, /new, or /reset and is
+        terminal.  Duplicate delivery is bounded by the process-local in-flight
+        set and durable seen set.
+        """
+        await super().on_processing_complete(event, outcome)
+        raw_ids = (event.metadata or {}).get("gateway_ingress_ack_ids")
+        event_ids = [str(value) for value in raw_ids] if isinstance(raw_ids, list) else []
+        if not event_ids:
+            return
+        terminal_cancel = bool((event.metadata or {}).get("gateway_terminal_cancel"))
+        if outcome != ProcessingOutcome.SUCCESS and not (
+            outcome == ProcessingOutcome.CANCELLED and terminal_cancel
+        ):
+            self._buzz_inflight.difference_update(event_ids)
+            self._buzz_replay_deferred.update(event_ids)
+            self._pending_replay_wake.set()
+            return
+        channel_id = str(getattr(event.source, "chat_id", "") or "")
+        state = self._channel_state.get(channel_id)
+        if state is None:
+            # Disconnect/replacement can clear runtime state while a turn
+            # unwinds.  The durable pending rows intentionally remain for the
+            # next process, yielding at-least-once rather than silent loss.
+            self._buzz_inflight.difference_update(event_ids)
+            return
+        for event_id in event_ids:
+            state.setdefault("pending", OrderedDict()).pop(event_id, None)
+            state["seen"][event_id] = None
+            self._buzz_inflight.discard(event_id)
+        self._trim_seen(state)
+        await self._persist_cursors()
+        self._pending_replay_wake.set()
 
 
 # ── Plugin registration ──────────────────────────────────────────────────────
