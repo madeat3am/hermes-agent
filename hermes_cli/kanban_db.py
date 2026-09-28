@@ -130,6 +130,7 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024  # one cap for dashboard, tools and CLI
+MAX_EDIT_RUNTIME_SECONDS = 24 * 60 * 60
 
 
 def _assert_not_delegated_child_mutation(path: "str | Path | None" = None) -> None:
@@ -3137,21 +3138,43 @@ def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> 
 def edit_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, priority: Optional[int] = None,
+    max_runtime_seconds: Optional[int] = None,
     result: Optional[str] = None, summary: Optional[str] = None,
     metadata: Optional[dict] = None, board: Optional[str] = None,
 ) -> bool:
-    """Edit task fields, optionally backfilling a completed task's result."""
+    """Edit task fields, optionally backfilling a completed task's result.
+
+    Runtime caps can only change while the task is not running, so a live
+    worker's dispatch contract cannot be altered underneath it.
+    """
+    if max_runtime_seconds is not None:
+        if isinstance(max_runtime_seconds, bool) or not (
+            1 <= max_runtime_seconds <= MAX_EDIT_RUNTIME_SECONDS
+        ):
+            raise ValueError(
+                f"max_runtime_seconds must be between 1 and {MAX_EDIT_RUNTIME_SECONDS}"
+            )
     changed_fields = [
-        field for field, value in (("title", title), ("body", body), ("priority", priority))
+        field for field, value in (
+            ("title", title), ("body", body), ("priority", priority),
+            ("max_runtime_seconds", max_runtime_seconds),
+        )
         if value is not None
     ]
     with write_txn(conn):
         status = _task_status(conn, task_id)
-        if status is None or (result is not None and status != "done"):
+        if (
+            status is None
+            or (result is not None and status != "done")
+            or (max_runtime_seconds is not None and status == "running")
+        ):
             return False
         assignments = []
         params = []
-        for field, value in (("title", title), ("body", body), ("priority", priority)):
+        for field, value in (
+            ("title", title), ("body", body), ("priority", priority),
+            ("max_runtime_seconds", max_runtime_seconds),
+        ):
             if value is not None:
                 assignments.append(f"{field} = ?")
                 params.append(value)
@@ -3170,7 +3193,10 @@ def edit_task(
         if result is None:
             non_priority_fields = [field for field in changed_fields if field != "priority"]
             if non_priority_fields:
-                _append_event(conn, task_id, "edited", {"fields": non_priority_fields})
+                payload: dict[str, object] = {"fields": non_priority_fields}
+                if max_runtime_seconds is not None:
+                    payload["max_runtime_seconds"] = max_runtime_seconds
+                _append_event(conn, task_id, "edited", payload)
         else:
             handoff_summary = summary if summary is not None else result
             changed_fields.append("summary")

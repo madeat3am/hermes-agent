@@ -54,6 +54,19 @@ def _nonnegative_int(value: str) -> int:
     return parsed
 
 
+def _bounded_runtime_seconds(value: str) -> int:
+    """Argparse type for a safe per-task runtime override in seconds."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer number of seconds") from exc
+    if not 1 <= parsed <= kb.MAX_EDIT_RUNTIME_SECONDS:
+        raise argparse.ArgumentTypeError(
+            f"must be between 1 and {kb.MAX_EDIT_RUNTIME_SECONDS} seconds"
+        )
+    return parsed
+
+
 def _run_state_args(type_help: str):
     return (
         _arg("--state-type", choices=("status", "outcome"), help=f"With --state-name: {type_help}"),
@@ -309,6 +322,9 @@ _SPECS = [
         _arg("--title", help="Replace the task title"),
         _arg("--body", help="Replace the task body"),
         _arg("--priority", type=int, help="Replace the task priority"),
+        _arg("--max-runtime-seconds", type=_bounded_runtime_seconds,
+             help="Replace the runtime cap for a non-running task "
+                  f"(1-{kb.MAX_EDIT_RUNTIME_SECONDS} seconds)"),
         _arg("--result", help="Backfilled task result text for a done task"),
         *_STEP_HANDOFF,
     ], help="Edit task fields or recovery fields on an already-completed task"),
