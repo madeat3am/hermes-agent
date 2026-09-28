@@ -500,6 +500,27 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
             cli.console.print(f"[bold blue]Query:[/] {_query_label}")
         cli._show_security_advisories()
         response = cli.chat(query, images=single_query_images or None)
+        # ``-q`` is finite just like ``-Q``. A message_agent delivery may finish after
+        # the requested turn, so consume its owned completion before this process exits
+        # and run the reply as a follow-up turn. Previously only the quiet path did this:
+        # the finalizer waited for the child, then discarded the queued completion.
+        from hermes_cli.quiet_single_query import (
+            continue_quiet_notify_completions, quiet_notify_linger_seconds,
+        )
+
+        try:
+            continued = continue_quiet_notify_completions(
+                getattr(cli, "session_id", "") or "",
+                lambda text: cli.chat(text),
+                owns_event=getattr(cli, "_owns_process_notification", None),
+                linger_budget=quiet_notify_linger_seconds(),
+            )
+        finally:
+            # The continuation loop owns this run's single bounded linger budget.
+            # Keep the finalizer from waiting a second time on a timed-out child.
+            cli._quiet_notify_linger_done = True
+        if continued is not None:
+            response = continued
         # Kanban goal_mode on the `-q` path: same judge loop as `-Q`, but each follow-up turn
         # runs through cli.chat so the worker log keeps its live tool feed (the dispatcher
         # used to force -Q here, which left goal_mode cards with a blank Worker log).
