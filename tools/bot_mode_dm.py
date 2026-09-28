@@ -80,6 +80,9 @@ def message_agent_tool_schema() -> dict:
                 "delivery failure — unless the ack returns reply_delivery=\"poll\", in which case "
                 "follow its process(action=\"wait\") instruction before ending the turn. COMPOSE the message yourself: write what YOU want to say to "
                 "that agent (lead with the point; include the concrete ask or result). "
+                "If your current turn came from a teammate, answer that teammate in your "
+                "normal final response; the delivery process returns it to them. Do not open "
+                "a second message_agent delivery back to that sender. "
                 "Never paste the user's words verbatim — paraphrase the actionable "
                 "substance, and keep private 1:1 chat content private. Message one "
                 "clearly relevant teammate when it genuinely helps the user's goal; "
@@ -195,6 +198,24 @@ def _err(message: str, *, roster: list[str] | None = None, peers: list[str] | No
     return json.dumps(payload)
 
 
+def _current_local_bot_sender(agent: Any) -> Optional[str]:
+    """The local profile that authored this turn, or None.
+
+    A direct-message child returns its final response through the delivery process that
+    created the turn. Opening another DM back to that same sender competes for the
+    sender's active-session lease and can deadlock a request/reply cycle. Remote author
+    ids are qualified (``bot:<origin>/<profile>``) and must keep using their transport.
+    """
+    from agent.turn_author import parse_turn_author
+
+    author = parse_turn_author(getattr(agent, "_turn_author", None))
+    author_id = str((author or {}).get("id") or "")
+    if not (author or {}).get("is_bot") or not author_id.startswith("bot:"):
+        return None
+    profile = author_id[len("bot:"):]
+    return profile if profile and "/" not in profile else None
+
+
 def message_agent_tool(target: str = "", message: str = "", task_id: Optional[str] = None, agent: Any = None) -> str:
     """Deliver ``message`` to ``target``'s Bot Chat. Returns a JSON ack/error.
     ``agent`` is the calling AIAgent — used for the Bot Chat gate and sender identity."""
@@ -286,6 +307,15 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
         return _roster_err(f"No teammate named '{raw_target}' on this install, on a connected "
                            "machine, or on a registered peer. Pick a name from the roster "
                            "(roles are listed in your system prompt).")
+    if resolved == _current_local_bot_sender(agent):
+        return json.dumps({
+            "status": "reply_via_completion",
+            "to": f"@{_handle(resolved)}",
+            "detail": (
+                "This teammate sent the current turn. Put your reply in this turn's final "
+                "response; the existing delivery process returns it. No second message was queued."
+            ),
+        })
     return _start_delivery([_hermes_cli(), "-p", resolved, *BOT_CHAT_TURN_ARGS], content, f"@{_handle(resolved)}",
                            stdin_file=False, profile_home=roster_homes[resolved], author=author, **delivery)
 

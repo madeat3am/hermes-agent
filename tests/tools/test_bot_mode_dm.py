@@ -343,6 +343,46 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
     assert '$(and this is not shell)' in content
 
 
+def test_reply_to_local_bot_sender_uses_existing_delivery_completion(tmp_path, monkeypatch):
+    """A recipient must not start a competing DM into the sender's owned session.
+
+    The original child process already carries this turn's final response back to the
+    sender, so the guard returns a successful routing instruction without spawning.
+    """
+    calls = _capture_spawn(monkeypatch)
+    home = _managed_home(tmp_path, teammates=("reviewer",))
+    reviewer = _FakeAgent(home / "profiles" / "reviewer", title="Bot Chat")
+    reviewer._turn_author = {"id": "bot:default", "name": "hermes", "is_bot": True}
+
+    result = json.loads(bot_mode_dm.message_agent_tool(
+        target="hermes", message="Review complete.", agent=reviewer))
+
+    assert result == {
+        "status": "reply_via_completion",
+        "to": "@hermes",
+        "detail": (
+            "This teammate sent the current turn. Put your reply in this turn's final "
+            "response; the existing delivery process returns it. No second message was queued."
+        ),
+    }
+    assert calls == []
+
+
+def test_remote_bot_author_does_not_suppress_local_delivery(tmp_path, monkeypatch):
+    """Qualified remote authors are different identities from local profiles."""
+    calls = _capture_spawn(monkeypatch)
+    monkeypatch.setattr(bot_relay, "_hermes_cli", lambda: "hermes")
+    home = _managed_home(tmp_path, teammates=("reviewer",))
+    reviewer = _FakeAgent(home / "profiles" / "reviewer", title="Bot Chat")
+    reviewer._turn_author = {"id": "bot:mini/default", "name": "hermes", "is_bot": True}
+
+    result = json.loads(bot_mode_dm.message_agent_tool(
+        target="hermes", message="Send locally.", agent=reviewer))
+
+    assert result["status"] == "queued"
+    assert len(calls) == 1
+
+
 
 
 def test_cli_runner_ack_is_queued_with_the_runner_delivery_id(tmp_path, monkeypatch):
