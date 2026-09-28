@@ -26,10 +26,18 @@ import pytest
 
 import tools.bot_mode_dm as bot_mode_dm
 import tools.bot_relay as bot_relay
-import pytest
 
 
 ENV = {"id": "d" * 32, "target_handle": "researcher", "target_connection": "ssh-vps"}
+
+
+@pytest.fixture(autouse=True)
+def _isolate_installation_command(monkeypatch):
+    """Keep path-resolution tests independent of the operator's real install manifest."""
+    monkeypatch.setattr(
+        "hermes_cli._launchers.installation_command",
+        lambda _repo_root: ["python", "-m", "hermes_cli.main"],
+    )
 
 
 @pytest.mark.platforms("windows")
