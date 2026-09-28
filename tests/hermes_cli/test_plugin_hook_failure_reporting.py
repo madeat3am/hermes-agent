@@ -18,6 +18,48 @@ def manager(tmp_path, monkeypatch):
     return PluginManager()
 
 
+def test_missing_configured_policy_blocks_effects_but_admits_named_reads(manager):
+    home = manager.home_path
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "plugins:\n"
+        "  pre_tool_call_policy_plugin: research-rigor-finalizer\n"
+        "  pre_tool_call_admitted_read_tools: [read_file]\n",
+        encoding="utf-8",
+    )
+
+    blocked = manager.invoke_hook("pre_tool_call", tool_name="terminal", args={})
+    admitted = manager.invoke_hook("pre_tool_call", tool_name="read_file", args={})
+
+    assert len(blocked) == 1
+    assert blocked[0]["action"] == "block"
+    assert "not loaded" in blocked[0]["message"]
+    assert admitted == []
+
+
+def test_dispatch_exception_blocks_effects_but_admits_named_reads(manager, monkeypatch):
+    home = manager.home_path
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "plugins:\n"
+        "  pre_tool_call_policy_plugin: research-rigor-finalizer\n"
+        "  pre_tool_call_admitted_read_tools: [read_file]\n",
+        encoding="utf-8",
+    )
+
+    def broken_dispatch(*args, **kwargs):
+        raise RuntimeError("policy hook unavailable")
+
+    monkeypatch.setattr("hermes_cli.plugins._dispatch_pre_tool_call_hooks", broken_dispatch)
+    from agent.agent_runtime_helpers import _pre_tool_block_message
+
+    blocked, _ = _pre_tool_block_message(None, "terminal", {}, "", "", [])
+    admitted, _ = _pre_tool_block_message(None, "read_file", {}, "", "", [])
+
+    assert "BLOCKED: pre_tool_call policy plugin" in blocked
+    assert admitted is None
+
+
 def test_identical_hook_failure_warns_once_then_debug(manager, caplog):
     def on_pre_tool(tool_data):  # core sends tool_name/args, never tool_data
         return None

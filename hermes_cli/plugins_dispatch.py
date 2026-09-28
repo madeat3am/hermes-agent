@@ -180,6 +180,92 @@ def _hook_uses_callback_timeout(hook_name: str, timeout: float) -> bool:
     return hook_name in _HOOK_TIMEOUT_BOUNDED_HOOKS or hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
 
 
+# citadel-pre-tool-call-fail-closed-v1: a profile that names its tool-effect policy plugin under
+# ``plugins.pre_tool_call_policy_plugin`` denies every tool except the names listed in
+# ``plugins.pre_tool_call_admitted_read_tools`` whenever that policy is not loaded, disabled, failed,
+# never registered ``pre_tool_call``, or raised. Profiles that name no policy keep the native
+# isolate-and-log behavior (hooks.md: callback errors are isolated). A timeout already fails closed
+# natively for every tool, admitted or not, and is left untouched.
+_PRE_TOOL_CALL_POLICY_PLUGIN_KEY = "pre_tool_call_policy_plugin"
+_PRE_TOOL_CALL_ADMITTED_READ_TOOLS_KEY = "pre_tool_call_admitted_read_tools"
+
+
+def _resolve_pre_tool_call_policy() -> Any:
+    """``(policy_plugin_name, admitted_read_tools)`` from ``plugins``; an unreadable
+    config is an unknown policy and blocks tools, while an unconfigured profile keeps native behavior."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        plugins_cfg = (load_config_readonly() or {}).get("plugins")
+    except Exception:
+        logger.warning("pre_tool_call fail-closed policy config unreadable; blocking tools",
+                       exc_info=True)
+        return "<unreadable profile policy>", frozenset()
+    if plugins_cfg is None:
+        return None, frozenset()
+    if not isinstance(plugins_cfg, dict):
+        return "<malformed profile policy>", frozenset()
+    policy = plugins_cfg.get(_PRE_TOOL_CALL_POLICY_PLUGIN_KEY)
+    policy = policy.strip() if isinstance(policy, str) else ""
+    if not policy and "research-rigor-finalizer" in (plugins_cfg.get("enabled") or ()):
+        policy = "research-rigor-finalizer"  # missing policy key must not disable the research guard
+    if not policy:
+        return None, frozenset()
+    admitted = plugins_cfg.get(_PRE_TOOL_CALL_ADMITTED_READ_TOOLS_KEY)
+    names = admitted if isinstance(admitted, (list, tuple)) else ()
+    return policy, frozenset(n.strip().casefold() for n in names if isinstance(n, str) and n.strip())
+
+
+def pre_tool_call_failure_directive(tool_name: Any, reason: str) -> Any:
+    """Block directive for *tool_name* while the profile's policy plugin cannot answer, else ``None``.
+
+    ``None`` when no policy plugin is named or when *tool_name* is an explicitly
+    admitted read tool. Never raises: callers invoke it from inside ``except`` blocks."""
+    try:
+        policy, admitted = _resolve_pre_tool_call_policy()
+    except Exception:
+        logger.warning("pre_tool_call fail-closed policy resolution raised; blocking tool", exc_info=True)
+        policy, admitted = "<unresolved profile policy>", frozenset()
+    if policy is None:
+        return None
+    name = tool_name.strip() if isinstance(tool_name, str) else ""
+    if name and name.casefold() in admitted:
+        return None
+    return {
+        "action": "block",
+        "message": (
+            f"BLOCKED: pre_tool_call policy plugin {policy!r} is unavailable ({reason}); "
+            f"{name or '<unnamed tool>'!r} is not an explicitly admitted read tool"
+        ),
+    }
+
+
+def _pre_tool_call_policy_missing(manager: Any, callbacks: Any) -> Any:
+    """Why the configured ``pre_tool_call`` policy plugin cannot be answering, or ``None``."""
+    try:
+        policy, _admitted = _resolve_pre_tool_call_policy()
+    except Exception:
+        logger.warning("pre_tool_call policy resolution raised; blocking tool", exc_info=True)
+        return "policy resolution raised"
+    if policy is None:
+        return None
+    loaded = None
+    for key, candidate in (getattr(manager, "_plugins", None) or {}).items():
+        if key == policy or getattr(getattr(candidate, "manifest", None), "name", None) == policy:
+            loaded = candidate
+            break
+    if loaded is None:
+        return f"policy plugin {policy!r} is not loaded"
+    if getattr(loaded, "error", None):
+        return f"policy plugin {policy!r} failed to load: {loaded.error}"
+    if not getattr(loaded, "enabled", False):
+        return f"policy plugin {policy!r} is disabled"
+    if "pre_tool_call" not in (getattr(loaded, "hooks_registered", None) or ()):
+        return f"policy plugin {policy!r} did not register pre_tool_call"
+    if not callbacks:
+        return "no pre_tool_call callbacks are registered"
+    return None
+
+
 class PluginDispatchMixin:
     _hook_timeout_lock: Any
     _hook_callback_waiters: Dict[tuple, List[threading.Event]]
@@ -232,7 +318,8 @@ class PluginDispatchMixin:
         timeout = _resolve_hook_callback_timeout()
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
-        for cb in self._hooks.get(hook_name, []):
+        callbacks = list(self._hooks.get(hook_name, []))
+        for cb in callbacks:
             try:
                 if use_timeout:
                     ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, timeout)
@@ -248,6 +335,12 @@ class PluginDispatchMixin:
                 self._report_hook_failure(hook_name, cb, kwargs, exc)
                 if fail_closed:  # a guard that raised made no decision: same veto as a timeout
                     results.append(_policy_error_block_directive(hook_name, cb, exc))
+        if fail_closed:  # citadel-pre-tool-call-fail-closed-v1: an absent policy is a denied policy
+            missing = _pre_tool_call_policy_missing(self, callbacks)
+            if missing is not None:
+                directive = pre_tool_call_failure_directive(kwargs.get("tool_name"), missing)
+                if directive is not None:
+                    results.append(directive)
         return results
 
     def _report_hook_failure(
