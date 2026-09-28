@@ -3856,6 +3856,38 @@ class TestChannelCursorPersistence:
                    for row in caplog.records)
 
     @pytest.mark.asyncio
+    async def test_live_websocket_retries_failed_processing_without_reconnect(self, adapter):
+        state = adapter._channel_state[CHANNEL] = adapter._new_channel_state("group")
+        state["pending"]["retry"] = _event(
+            "retry", content="@Chip retry on live websocket", created_at=200)
+        adapter._buzz_inflight.add("retry")
+        adapter._ws_task = asyncio.current_task()
+        adapter._poll_replay_retry_delay = 0
+        dispatched = []
+
+        async def capture(**kwargs):
+            dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._resolve_user_name = AsyncMock(return_value="Researcher")
+        source = adapter.build_source(
+            chat_id=CHANNEL, chat_type="group", user_id=OTHER_PUBKEY, message_id="retry")
+        event = MessageEvent(
+            text="retry", source=source, message_id="retry",
+            metadata={"gateway_ingress_ack_ids": ["retry"]},
+        )
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+        for _ in range(20):
+            if dispatched:
+                break
+            await asyncio.sleep(0)
+
+        assert [row["message_id"] for row in dispatched] == ["retry"]
+        assert "retry" not in adapter._buzz_replay_deferred
+        adapter._ws_task = None
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(("outcome", "extra_metadata"), [
         (ProcessingOutcome.SUCCESS, {}),
         (ProcessingOutcome.CANCELLED, {"gateway_terminal_cancel": True}),

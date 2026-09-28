@@ -491,7 +491,9 @@ async function drainRelayOutboxes() {
           noteRelayOutboxWork({ connectionId: sender.id })
         }
       } catch {
-        // Older backend without the relay RPCs — skip this connection.
+        // A transient RPC failure must not consume this route's only work
+        // signal. The interval will retry its durable outbox.
+        noteRelayOutboxWork({ connectionId: sender.id })
       }
     }
 

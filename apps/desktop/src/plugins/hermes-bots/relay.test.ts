@@ -825,6 +825,28 @@ describe('the drain loop wires drain → deliver → reply', () => {
     stopBotRelay()
   })
 
+  it('retries a signaled route after a transient drain RPC failure', async () => {
+    let failures = 2
+    const calls = respondWith(call => {
+      if (call.method === 'bot_relay.outbox.drain' && call.connectionId === 'a' && failures > 0) {
+        failures -= 1
+        throw new Error('connection reset')
+      }
+      return { envelopes: [] }
+    })
+    const { startBotRelay, stopBotRelay } = await loadRelay()
+
+    startBotRelay()
+    await vi.advanceTimersByTimeAsync(RELAY_PUSH_DEBOUNCE_MS + 10)
+    expect(calls.filter(call => call.method === 'bot_relay.outbox.drain' && call.connectionId === 'a')).toHaveLength(2)
+
+    calls.length = 0
+    await vi.advanceTimersByTimeAsync(RELAY_DRAIN_INTERVAL_MS)
+    expect(calls.filter(call => call.method === 'bot_relay.outbox.drain').map(call => call.connectionId)).toEqual(['a'])
+
+    stopBotRelay()
+  })
+
   it('falls back to the legacy empty drain params during a rolling upgrade', async () => {
     const calls = respondWith(call => {
       if (call.method === 'bot_relay.outbox.drain' && 'available_connections' in call.params) {

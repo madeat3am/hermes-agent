@@ -1763,15 +1763,18 @@ class BuzzAdapter(BasePlatformAdapter):
             self._pending_replay_wake.set()
 
     def _schedule_poll_replay_retry(self) -> None:
-        """Re-arm failed durable inbox rows once after bounded poll backoff.
+        """Re-arm failed durable inbox rows after bounded transport backoff.
 
-        WebSocket failures keep their reconnect epoch: only a live poll task
-        owns this timer.  Coalescing failures behind one timer prevents an
+        Coalescing failures behind one timer prevents an
         inclusive relay poll and repeated completion hooks from dispatching
         the same saved row twice.  This retries ingress processing only; the
         delivery ledger still fences an outbound send with an ambiguous result.
         """
-        if self._poll_task is None or self._poll_task.done():
+        transport_live = (
+            (self._poll_task is not None and not self._poll_task.done())
+            or (self._ws_task is not None and not self._ws_task.done())
+        )
+        if not transport_live:
             return
         if self._poll_replay_retry_task is not None and not self._poll_replay_retry_task.done():
             return
@@ -1783,8 +1786,12 @@ class BuzzAdapter(BasePlatformAdapter):
             current = asyncio.current_task()
             try:
                 await asyncio.sleep(delay)
-                if self._poll_task is not None and not self._poll_task.done():
-                    self._rearm_pending_replay("poll processing retry")
+                transport_live = (
+                    (self._poll_task is not None and not self._poll_task.done())
+                    or (self._ws_task is not None and not self._ws_task.done())
+                )
+                if transport_live:
+                    self._rearm_pending_replay("transport processing retry")
             finally:
                 if self._poll_replay_retry_task is current:
                     self._poll_replay_retry_task = None
