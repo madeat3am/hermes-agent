@@ -33,6 +33,20 @@ _HEADER_RE = re.compile(
     rf"^(?P<key>{'|'.join(map(re.escape, _FIELDS))}):[ \t]*(?P<value>[^\r\n]+?)[ \t]*\r?$",
     re.MULTILINE,
 )
+_SPECIFIED_FIELD_RES = {
+    "request_id": re.compile(r"^-[ \t]+request_id:[ \t]*(?P<value>[^\r\n]+?)[ \t]*\r?$", re.MULTILINE),
+    "artifact_path": re.compile(r"^-[ \t]+Artifact:[ \t]*(?P<value>[^\r\n]+?)[ \t]*\r?$", re.MULTILINE),
+    "artifact_sha256": re.compile(
+        r"^-[ \t]+Expected artifact_sha256:[ \t]*(?P<value>[^\r\n]+?)[ \t]*\r?$",
+        re.MULTILINE,
+    ),
+}
+_SPECIFIED_ROUTE_RE = re.compile(
+    r"^-[ \t]+Report answering provider/model:[ \t]*"
+    r"(?P<provider>[A-Za-z0-9][A-Za-z0-9_.:-]{0,127})[ \t]+/[ \t]+"
+    r"(?P<model>[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255})\.[ \t]*\r?$",
+    re.MULTILINE,
+)
 _FAMILY_RULES = (
     ("openai-codex", re.compile(r"^gpt-"), "openai"),
     ("xai-oauth", re.compile(r"^grok-"), "xai"),
@@ -50,9 +64,27 @@ def _check_review_worker() -> bool:
 
 
 def _request_fields(body: str) -> dict[str, str]:
-    found: dict[str, list[str]] = {key: [] for key in _FIELDS}
+    canonical: dict[str, list[str]] = {key: [] for key in _FIELDS}
     for match in _HEADER_RE.finditer(body or ""):
-        found[match.group("key")].append(match.group("value").strip())
+        canonical[match.group("key")].append(match.group("value").strip())
+
+    # A triage specifier may rewrite an already-bound review card into this
+    # exact labelled form. Accept only that complete dialect; do not infer from
+    # prose or mix it with canonical headers.
+    specified: dict[str, list[str]] = {key: [] for key in _FIELDS}
+    for key, pattern in _SPECIFIED_FIELD_RES.items():
+        specified[key].extend(match.group("value").strip() for match in pattern.finditer(body or ""))
+    for match in _SPECIFIED_ROUTE_RE.finditer(body or ""):
+        specified["answering_provider"].append(match.group("provider").strip())
+        specified["answering_model"].append(match.group("model").strip())
+
+    has_canonical = any(canonical.values())
+    has_specified = any(specified.values())
+    _check(
+        not (has_canonical and has_specified),
+        "review request mixes canonical and specified binding fields",
+    )
+    found = specified if has_specified else canonical
     missing = [key for key, values in found.items() if not values]
     duplicate = [key for key, values in found.items() if len(values) > 1]
     _check(not missing, f"review request is missing required field(s): {', '.join(missing)}")

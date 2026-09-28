@@ -258,9 +258,16 @@ class _KanbanDispatcher:
                 try:
                     os.environ["HERMES_KANBAN_BOARD"] = slug
                     try:
-                        triage_ids = _decomp.list_triage_ids()
+                        # ``triage`` also contains established work escalated
+                        # for human intervention.  Only untouched intake cards
+                        # may be rewritten by the automatic decomposer.
+                        triage_ids = _decomp.list_auto_decompose_ids()
                     except Exception as exc:
-                        logger.debug("kanban auto-decompose: list_triage_ids failed on board %s (%s)", slug, exc)
+                        logger.debug(
+                            "kanban auto-decompose: list_auto_decompose_ids failed on board %s (%s)",
+                            slug,
+                            exc,
+                        )
                         triage_ids = []
                     for tid in triage_ids:
                         if attempted >= auto_decompose_per_tick:

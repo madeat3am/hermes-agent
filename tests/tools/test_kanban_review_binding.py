@@ -167,3 +167,56 @@ def test_native_sequential_dispatch_binds_active_route(review_worker):
     assert result["ok"] is True
     assert result["binding"]["reviewer_provider"] == "xai-oauth"
     assert result["binding"]["reviewer_model"] == "grok-4.7"
+
+
+def _replace_task_body(task_id: str, body: str) -> None:
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    with kbc.connect() as conn:
+        assert kb.edit_task(conn, task_id, body=body)
+
+
+def _specified_body(review_worker) -> str:
+    return "\n".join(
+        (
+            "Identity and binding:",
+            "- Task: t_review",
+            "- request_id: req-123",
+            f"- Artifact: {review_worker.report}",
+            f"- Expected artifact_sha256: {review_worker.digest}",
+            f"- Expected normalized_text_sha256: {review_worker.digest}",
+            "- Report answering provider/model: openai-codex / gpt-6-astra.",
+        )
+    )
+
+
+def test_review_binding_accepts_exact_specifier_rewrite(review_worker):
+    _replace_task_body(review_worker.task_id, _specified_body(review_worker))
+
+    result = _call_binding()
+
+    assert result["ok"] is True
+    assert result["binding"]["request_id"] == "req-123"
+    assert result["binding"]["artifact_sha256"] == review_worker.digest
+    assert result["binding"]["same_family"] is False
+
+
+def test_review_binding_rejects_mixed_canonical_and_specified_identity(review_worker):
+    _replace_task_body(
+        review_worker.task_id,
+        _specified_body(review_worker) + "\nrequest_id: another-request",
+    )
+
+    result = _call_binding()
+
+    assert result["error"] == "review request mixes canonical and specified binding fields"
+
+
+def test_review_binding_rejects_near_match_specifier_labels(review_worker):
+    body = _specified_body(review_worker).replace("- Artifact:", "- artifact_path:")
+    _replace_task_body(review_worker.task_id, body)
+
+    result = _call_binding()
+
+    assert "review request is missing required field(s): artifact_path" in result["error"]
