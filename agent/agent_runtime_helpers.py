@@ -2459,6 +2459,14 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
             )
+            if function_name == "kanban_review_binding":
+                # The binding tool must use the route that actually produced this
+                # tool call (including an activated fallback), never model-supplied
+                # identity or the profile's configured default.
+                dispatch_kwargs.update(
+                    runtime_provider=str(getattr(agent, "provider", "") or ""),
+                    runtime_model=str(getattr(agent, "model", "") or ""),
+                )
             if skip_tool_execution_middleware:
                 dispatch_kwargs["skip_tool_execution_middleware"] = True
             import model_tools

@@ -26,10 +26,18 @@ import pytest
 
 import tools.bot_mode_dm as bot_mode_dm
 import tools.bot_relay as bot_relay
-import pytest
 
 
 ENV = {"id": "d" * 32, "target_handle": "researcher", "target_connection": "ssh-vps"}
+
+
+@pytest.fixture(autouse=True)
+def _isolate_installation_command(monkeypatch):
+    """Keep path-resolution tests independent of the operator's real install manifest."""
+    monkeypatch.setattr(
+        "hermes_cli._launchers.installation_command",
+        lambda _repo_root: ["python", "-m", "hermes_cli.main"],
+    )
 
 
 @pytest.mark.platforms("windows")
@@ -56,6 +64,24 @@ def test_local_delivery_resolves_sibling_hermes(tmp_path, monkeypatch):
     assert argv[0] == str(sibling)
     assert argv[1:3] == ["-p", "ops"]
     assert argv[argv.index("--query-file") + 1] == "query.json"
+
+
+def test_local_delivery_prefers_installation_bound_hermes(tmp_path, monkeypatch):
+    managed = tmp_path / ".hermes" / "bin" / "hermes"
+    captured = {}
+
+    def fake_installation_command(repo_root):
+        captured["repo_root"] = Path(repo_root)
+        return [str(managed)]
+
+    monkeypatch.setattr("hermes_cli._launchers.installation_command", fake_installation_command)
+    monkeypatch.setattr(bot_relay.shutil, "which", lambda _name: "/ambient/hermes")
+
+    argv = bot_relay.local_delivery_command("ops", "query.json")
+
+    assert captured["repo_root"] == Path(bot_relay.__file__).resolve().parents[1]
+    assert argv[0] == str(managed)
+    assert argv[1:3] == ["-p", "ops"]
 
 
 def test_local_delivery_uses_shutil_which_when_no_sibling(tmp_path, monkeypatch):

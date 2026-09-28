@@ -28,6 +28,10 @@ def _run_non_quiet(monkeypatch, turn_result):
     monkeypatch.setattr(cli, "_collect_query_images", lambda q, i: (q, []))
     monkeypatch.setattr(cli, "_collect_kanban_task_images", lambda imgs: [])
     monkeypatch.setattr(cli, "_finalize_single_query", lambda c: None)
+    monkeypatch.setattr(
+        "hermes_cli.quiet_single_query.continue_quiet_notify_completions",
+        lambda *a, **k: None,
+    )
     stub = SimpleNamespace(
         _single_query_mode=False,
         _claim_active_session=lambda *a, **k: True,
@@ -36,12 +40,53 @@ def _run_non_quiet(monkeypatch, turn_result):
         chat=lambda *a, **k: "response",
         _print_exit_summary=lambda **k: None,
         _last_turn_result=turn_result,
+        session_id="session-one-shot",
     )
     try:
         cli._run_single_query_mode(stub, "do the thing", None, False, True)
     except SystemExit as exc:
         return exc.code
     return None
+
+
+def test_non_quiet_one_shot_runs_owned_completion_as_follow_up(monkeypatch):
+    """A visible ``-q`` Bot Chat must not wait for a DM reply and then drop it at exit."""
+    monkeypatch.setattr(cli, "_should_seed_interactive", lambda *a, **k: False)
+    monkeypatch.setattr(cli, "_collect_query_images", lambda q, i: (q, []))
+    monkeypatch.setattr(cli, "_collect_kanban_task_images", lambda imgs: [])
+    monkeypatch.setattr(cli, "_finalize_single_query", lambda c: None)
+
+    prompts = []
+    owner = object()
+    stub = SimpleNamespace(
+        _single_query_mode=False,
+        _claim_active_session=lambda *a, **k: True,
+        console=SimpleNamespace(print=lambda *a, **k: None),
+        _show_security_advisories=lambda: None,
+        chat=lambda text, **k: prompts.append(text) or ("sent" if len(prompts) == 1 else "relayed PONG"),
+        _print_exit_summary=lambda **k: None,
+        _last_turn_result={"final_response": "relayed PONG", "completed": True},
+        _owns_process_notification=owner,
+        session_id="session-one-shot",
+    )
+    seen = {}
+
+    def continue_completion(session_id, run_turn, **kwargs):
+        seen.update(session_id=session_id, owns_event=kwargs["owns_event"])
+        return run_turn("[IMPORTANT: Reviewer replied PONG]")
+
+    monkeypatch.setattr(
+        "hermes_cli.quiet_single_query.continue_quiet_notify_completions",
+        continue_completion,
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli._run_single_query_mode(stub, "ask Reviewer", None, False, True)
+
+    assert exc.value.code == 0
+    assert prompts == ["ask Reviewer", "[IMPORTANT: Reviewer replied PONG]"]
+    assert seen == {"session_id": "session-one-shot", "owns_event": owner}
+    assert stub._quiet_notify_linger_done is True
 
 
 @pytest.mark.parametrize(

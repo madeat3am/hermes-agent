@@ -154,12 +154,54 @@ afterEach(() => {
 })
 
 describe('push-notified drain (#93091)', () => {
+  it('probes every route once at startup to recover notifications missed while the Desktop was down', async () => {
+    const persisted = [
+      {
+        id: 'env-from-downtime',
+        message: 'resume the same request',
+        target_connection: 'b',
+        target_profile: 'ops'
+      }
+    ]
+    const calls = respondWith(call => {
+      if (call.method === 'bot_relay.outbox.drain') {
+        return { envelopes: call.connectionId === 'a' ? persisted.splice(0) : [] }
+      }
+
+      return call.method === 'bot_relay.deliver' ? { reply: 'resumed once' } : {}
+    })
+    const { startBotRelay, stopBotRelay } = await loadRelay()
+
+    startBotRelay()
+    await vi.advanceTimersByTimeAsync(RELAY_PUSH_DEBOUNCE_MS + 10)
+
+    expect(calls.filter(call => call.method === 'bot_relay.outbox.drain').map(call => call.connectionId)).toEqual([
+      'a',
+      'b'
+    ])
+    expect(calls.filter(call => call.method === 'bot_relay.deliver')).toEqual([
+      expect.objectContaining({
+        connectionId: 'b',
+        params: expect.objectContaining({ message: 'resume the same request', profile: 'ops' })
+      })
+    ])
+    expect(calls.filter(call => call.method === 'bot_relay.reply')).toEqual([
+      expect.objectContaining({ connectionId: 'a', params: { id: 'env-from-downtime', reply: 'resumed once' } })
+    ])
+
+    calls.length = 0
+    await vi.advanceTimersByTimeAsync(RELAY_DRAIN_INTERVAL_MS)
+    expect(calls.filter(call => call.method === 'bot_relay.outbox.drain')).toHaveLength(0)
+
+    stopBotRelay()
+  })
+
   it('collapses a burst of pending signals into ONE drain', async () => {
     const calls = respondWith(() => ({ envelopes: [] }))
     const { startBotRelay, stopBotRelay } = await loadRelay()
 
     startBotRelay()
-    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(RELAY_PUSH_DEBOUNCE_MS + 10)
     calls.length = 0
 
     await pushAndSettle(6)
@@ -175,7 +217,7 @@ describe('push-notified drain (#93091)', () => {
     const { startBotRelay, stopBotRelay } = await loadRelay()
 
     startBotRelay()
-    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(RELAY_PUSH_DEBOUNCE_MS + 10)
     calls.length = 0
 
     await pushAndSettle()
@@ -195,7 +237,7 @@ describe('push-notified drain (#93091)', () => {
     const { startBotRelay, stopBotRelay } = await loadRelay()
 
     startBotRelay()
-    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(RELAY_PUSH_DEBOUNCE_MS + 10)
     calls.length = 0
 
     await vi.advanceTimersByTimeAsync(RELAY_DRAIN_INTERVAL_MS - 1000)
@@ -310,7 +352,7 @@ describe('the 30s drain does not open a gateway socket with nothing to deliver (
     const { startBotRelay, stopBotRelay } = await loadRelay()
 
     startBotRelay()
-    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(RELAY_PUSH_DEBOUNCE_MS + 10)
     calls.length = 0
 
     await vi.advanceTimersByTimeAsync(RELAY_DRAIN_INTERVAL_MS)
@@ -325,10 +367,38 @@ describe('the 30s drain does not open a gateway socket with nothing to deliver (
     const { startBotRelay, stopBotRelay } = await loadRelay()
 
     startBotRelay()
-    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(RELAY_PUSH_DEBOUNCE_MS + 10)
     calls.length = 0
 
     await pushAndSettle(1, { connectionId: 'a' })
+
+    expect(calls.filter(call => call.method === 'bot_relay.outbox.drain').map(call => call.connectionId)).toEqual(['a'])
+
+    stopBotRelay()
+  })
+
+  it('revisits a sender whose unavailable-target envelope was deferred', async () => {
+    const calls = respondWith(call =>
+      call.method === 'bot_relay.outbox.drain' && call.connectionId === 'a'
+        ? { deferred: true, envelopes: [] }
+        : { deferred: false, envelopes: [] }
+    )
+    const { startBotRelay, stopBotRelay } = await loadRelay()
+
+    startBotRelay()
+    await vi.advanceTimersByTimeAsync(RELAY_PUSH_DEBOUNCE_MS + 10)
+    calls.length = 0
+
+    await pushAndSettle(1, { connectionId: 'a' })
+    const firstDrain = calls.find(call => call.method === 'bot_relay.outbox.drain')
+
+    expect(firstDrain).toMatchObject({
+      connectionId: 'a',
+      params: { available_connections: ['a', 'b'] }
+    })
+
+    calls.length = 0
+    await vi.advanceTimersByTimeAsync(RELAY_DRAIN_INTERVAL_MS)
 
     expect(calls.filter(call => call.method === 'bot_relay.outbox.drain').map(call => call.connectionId)).toEqual(['a'])
 
@@ -748,7 +818,53 @@ describe('the drain loop wires drain → deliver → reply', () => {
 
     expect(calls.filter(call => call.method === 'bot_relay.outbox.drain').map(call => call.connectionId)).toEqual([
       'a',
+      'a',
       'b'
+    ])
+
+    stopBotRelay()
+  })
+
+  it('retries a signaled route after a transient drain RPC failure', async () => {
+    let failures = 2
+    const calls = respondWith(call => {
+      if (call.method === 'bot_relay.outbox.drain' && call.connectionId === 'a' && failures > 0) {
+        failures -= 1
+        throw new Error('connection reset')
+      }
+      return { envelopes: [] }
+    })
+    const { startBotRelay, stopBotRelay } = await loadRelay()
+
+    startBotRelay()
+    await vi.advanceTimersByTimeAsync(RELAY_PUSH_DEBOUNCE_MS + 10)
+    expect(calls.filter(call => call.method === 'bot_relay.outbox.drain' && call.connectionId === 'a')).toHaveLength(2)
+
+    calls.length = 0
+    await vi.advanceTimersByTimeAsync(RELAY_DRAIN_INTERVAL_MS)
+    expect(calls.filter(call => call.method === 'bot_relay.outbox.drain').map(call => call.connectionId)).toEqual(['a'])
+
+    stopBotRelay()
+  })
+
+  it('falls back to the legacy empty drain params during a rolling upgrade', async () => {
+    const calls = respondWith(call => {
+      if (call.method === 'bot_relay.outbox.drain' && 'available_connections' in call.params) {
+        throw new Error('invalid params: available_connections')
+      }
+
+      return { envelopes: [] }
+    })
+    const { startBotRelay, stopBotRelay } = await loadRelay()
+
+    startBotRelay()
+    await vi.advanceTimersByTimeAsync(RELAY_PUSH_DEBOUNCE_MS + 10)
+    calls.length = 0
+    await pushAndSettle(1, { connectionId: 'a' })
+
+    expect(calls.filter(call => call.method === 'bot_relay.outbox.drain').map(call => call.params)).toEqual([
+      { available_connections: ['a', 'b'] },
+      {}
     ])
 
     stopBotRelay()
@@ -805,7 +921,13 @@ describe('stop halts both loops', () => {
     startBotRelay()
     await vi.advanceTimersByTimeAsync(RELAY_PUSH_DEBOUNCE_MS + 10)
 
-    expect(drains).toBe(afterStop)
+    // Restart intentionally performs one all-route recovery probe. The stale
+    // mid-drain rerun stays forgotten, so exactly the two current routes are
+    // visited and no extra pass follows.
+    expect(drains).toBe(afterStop + 2)
+    const afterStartupRecovery = drains
+    await vi.advanceTimersByTimeAsync(RELAY_DRAIN_INTERVAL_MS)
+    expect(drains).toBe(afterStartupRecovery)
 
     stopBotRelay()
   })

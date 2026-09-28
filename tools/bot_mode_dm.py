@@ -31,8 +31,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-# Top-level imports stay stdlib-only: this module also runs directly as the background
-# delivery runner (``python bot_mode_dm.py --run-delivery …``); Hermes helpers import lazily.
+# Top-level imports stay stdlib-only: this module also runs as the background delivery
+# runner through the installation launcher; Hermes helpers import lazily.
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +80,9 @@ def message_agent_tool_schema() -> dict:
                 "delivery failure — unless the ack returns reply_delivery=\"poll\", in which case "
                 "follow its process(action=\"wait\") instruction before ending the turn. COMPOSE the message yourself: write what YOU want to say to "
                 "that agent (lead with the point; include the concrete ask or result). "
+                "If your current turn came from a teammate, answer that teammate in your "
+                "normal final response; the delivery process returns it to them. Do not open "
+                "a second message_agent delivery back to that sender. "
                 "Never paste the user's words verbatim — paraphrase the actionable "
                 "substance, and keep private 1:1 chat content private. Message one "
                 "clearly relevant teammate when it genuinely helps the user's goal; "
@@ -195,6 +198,24 @@ def _err(message: str, *, roster: list[str] | None = None, peers: list[str] | No
     return json.dumps(payload)
 
 
+def _current_local_bot_sender(agent: Any) -> Optional[str]:
+    """The local profile that authored this turn, or None.
+
+    A direct-message child returns its final response through the delivery process that
+    created the turn. Opening another DM back to that same sender competes for the
+    sender's active-session lease and can deadlock a request/reply cycle. Remote author
+    ids are qualified (``bot:<origin>/<profile>``) and must keep using their transport.
+    """
+    from agent.turn_author import parse_turn_author
+
+    author = parse_turn_author(getattr(agent, "_turn_author", None))
+    author_id = str((author or {}).get("id") or "")
+    if not (author or {}).get("is_bot") or not author_id.startswith("bot:"):
+        return None
+    profile = author_id[len("bot:"):]
+    return profile if profile and "/" not in profile else None
+
+
 def message_agent_tool(target: str = "", message: str = "", task_id: Optional[str] = None, agent: Any = None) -> str:
     """Deliver ``message`` to ``target``'s Bot Chat. Returns a JSON ack/error.
     ``agent`` is the calling AIAgent — used for the Bot Chat gate and sender identity."""
@@ -286,6 +307,15 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
         return _roster_err(f"No teammate named '{raw_target}' on this install, on a connected "
                            "machine, or on a registered peer. Pick a name from the roster "
                            "(roles are listed in your system prompt).")
+    if resolved == _current_local_bot_sender(agent):
+        return json.dumps({
+            "status": "reply_via_completion",
+            "to": f"@{_handle(resolved)}",
+            "detail": (
+                "This teammate sent the current turn. Put your reply in this turn's final "
+                "response; the existing delivery process returns it. No second message was queued."
+            ),
+        })
     return _start_delivery([_hermes_cli(), "-p", resolved, *BOT_CHAT_TURN_ARGS], content, f"@{_handle(resolved)}",
                            stdin_file=False, profile_home=roster_homes[resolved], author=author, **delivery)
 
@@ -299,7 +329,7 @@ def _try_relay_delivery(root: Path, raw_target: str, content: str, me: str, *,
     try:
         from tools.bot_mode_probe import _handle, local_taken_forms
         from tools.bot_relay import (
-            EnvelopeRefusedError, _target_aliases, enqueue_envelope, read_remote_roster, remote_target_forms,
+            _target_aliases, enqueue_envelope, read_remote_roster, remote_target_forms,
             resolve_remote_target, waiter_command,
         )
 
@@ -312,13 +342,7 @@ def _try_relay_delivery(root: Path, raw_target: str, content: str, me: str, *,
             forms = ", ".join(form for r, form in zip(roster, remote_target_forms(roster, local_taken_forms(root)))
                               if want in _target_aliases(r))
             return _err(f"'{raw_target}' exists on several connected machines — disambiguate with one of: {forms}.")
-        try:
-            envelope = enqueue_envelope(root, target=match, message=content, sender_profile=me, sender_handle=_handle(me))
-        except EnvelopeRefusedError as exc:
-            # Fail fast: target definitively offline — nothing was queued.
-            # Structured refusal so the agent can distinguish it from a resolution error ('runtime_offline'
-            # per the #93091 reason enum).
-            return json.dumps({"error": str(exc), "reason": exc.reason})
+        envelope = enqueue_envelope(root, target=match, message=content, sender_profile=me, sender_handle=_handle(me))
         label = f"@{match['handle']} on {match['connection_label'] or match['connection_id']}"
         raw = _spawn_delivery(waiter_command(root, envelope), label, delivery_id=envelope["id"], task_id=task_id, agent=agent)
         waiter_error = json.loads(raw).get("error")
@@ -585,18 +609,28 @@ def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool,
                       profile_home: Path | None = None, author: Optional[dict] = None) -> str:
     """Build an argv-safe command for the cleanup-owning background runner:
     ``--run-delivery [--author <json>] <mode> <dm_file> [--profile-home <path>] <argv...>``."""
-    runner_argv = [sys.executable, str(Path(__file__).resolve()), "--run-delivery",
-                   "stdin" if stdin_file else "query-file", dm_file]
+    runner_args = ["--run-delivery", "stdin" if stdin_file else "query-file", dm_file]
     if profile_home is not None:
-        runner_argv.extend(["--profile-home", str(Path(profile_home).resolve())])
-    runner_argv.extend(argv)
+        runner_args.extend(["--profile-home", str(Path(profile_home).resolve())])
+    runner_args.extend(argv)
+    # A managed source install runs its store Python in isolated mode; only the
+    # installation launcher activates the selected dependency generation.  A
+    # raw ``sys.executable bot_mode_dm.py`` child therefore cannot import the
+    # Hermes helpers used by ``_run_delivery`` (for example ruamel.yaml).
+    from hermes_cli._launchers import installation_command
+
+    runner_argv = installation_command(
+        Path(__file__).resolve().parents[1], runner_args, module="tools.bot_mode_dm")
     if sys.platform == "win32":
         # The tracked local backend uses Git Bash on native Windows: forward slashes keep drive
         # paths executable there; backslash paths are parsed as command names (exit 127).
         runner_argv = [part.replace("\\", "/") for part in runner_argv]
     if author:
-        # Inserted after the slash rewrite: JSON escapes are backslashes too.
-        runner_argv[3:3] = ["--author", json.dumps(author, separators=(",", ":"))]
+        # Inserted after the slash rewrite: JSON escapes are backslashes too.  The managed
+        # launcher has a variable-length prefix, so anchor on the runner's own argument.
+        marker = runner_argv.index("--run-delivery")
+        runner_argv[marker + 1:marker + 1] = [
+            "--author", json.dumps(author, separators=(",", ":"))]
     return shlex.join(runner_argv)
 
 

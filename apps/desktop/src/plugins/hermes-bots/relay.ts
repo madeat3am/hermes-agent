@@ -458,17 +458,42 @@ async function drainRelayOutboxes() {
       }
 
       try {
-        const res = await host.requestProfile<{ envelopes?: RelayEnvelope[] }>(
-          sender.route,
-          'bot_relay.outbox.drain',
-          {}
-        )
+        let res: { deferred?: boolean; envelopes?: RelayEnvelope[] }
+
+        try {
+          res = await host.requestProfile<{ deferred?: boolean; envelopes?: RelayEnvelope[] }>(
+            sender.route,
+            'bot_relay.outbox.drain',
+            { available_connections: [...byId.keys()] }
+          )
+        } catch {
+          // A rolling upgrade can put the new Desktop in front of an older
+          // strict-contract gateway. Its failed validation cannot have entered
+          // the handler, and a response lost after an atomic claim makes the
+          // legacy retry return an empty list, so this fallback cannot cause a
+          // second delivery.
+          res = await host.requestProfile<{ deferred?: boolean; envelopes?: RelayEnvelope[] }>(
+            sender.route,
+            'bot_relay.outbox.drain',
+            {}
+          )
+        }
 
         for (const envelope of Array.isArray(res?.envelopes) ? res.envelopes : []) {
           queued.push({ envelope, sender })
         }
+
+        // The gateway deliberately left mail for a currently absent target in
+        // its outbox. Keep this sender route in the work set after the
+        // monotone push signal was consumed, so the 30s backstop revisits it,
+        // enforces TTL, and claims it as soon as the target reconnects.
+        if (res?.deferred) {
+          noteRelayOutboxWork({ connectionId: sender.id })
+        }
       } catch {
-        // Older backend without the relay RPCs — skip this connection.
+        // A transient RPC failure must not consume this route's only work
+        // signal. The interval will retry its durable outbox.
+        noteRelayOutboxWork({ connectionId: sender.id })
       }
     }
 
@@ -644,6 +669,14 @@ export function startBotRelay() {
       noteRelayOutboxWork(event)
       scheduleRelayPushDrain()
     })
+
+    // An outbox notification broadcast while the Desktop was stopped cannot
+    // be replayed by the shell. Probe every route once on startup so durable
+    // envelopes already on disk re-enter the normal availability-aware drain.
+    // Later idle intervals remain silent because this marker is consumed by
+    // the debounced pass.
+    noteRelayOutboxWork()
+    scheduleRelayPushDrain()
   }
 }
 

@@ -63,11 +63,21 @@ def _(rid, params: dict, _root=_relay_root) -> dict:
 
 @method("bot_relay.outbox.drain")
 def _(rid, params: dict, _root=_relay_root) -> dict:
-    """Claim every pending cross-connection envelope queued here → ``{envelopes}``; claimed
-    envelopes move to ``claimed/`` atomically so concurrent drains can't double-deliver."""
+    """Claim envelopes whose target connection is currently available.
+
+    Unavailable envelopes remain queued and ``deferred`` asks the Desktop to
+    revisit this sender route after consuming its one-shot outbox signal.
+    """
     try:
-        from tools.bot_relay import claim_pending_envelopes
-        return _ok(rid, {"envelopes": claim_pending_envelopes(_root())})
+        from tools.bot_relay import drain_pending_envelopes
+        available = params.get("available_connections")
+        available_connections = None if available is None else {
+            str(connection_id).strip() for connection_id in available if str(connection_id).strip()
+        }
+        envelopes, deferred = drain_pending_envelopes(
+            _root(), available_connections=available_connections,
+        )
+        return _ok(rid, {"envelopes": envelopes, "deferred": deferred})
     except Exception as e:
         return _err(rid, 5091, str(e))
 

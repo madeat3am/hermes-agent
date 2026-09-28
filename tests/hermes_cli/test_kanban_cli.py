@@ -100,6 +100,55 @@ def test_kanban_edit_updates_documented_task_fields(kanban_home):
     assert any(event.kind == "reprioritized" for event in events)
 
 
+def test_kanban_edit_updates_blocked_task_runtime_with_audit_event(kanban_home):
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn, title="retry exact-source review", max_runtime_seconds=300,
+            initial_status="blocked",
+        )
+
+    output = kc.run_slash(f"edit {task_id} --max-runtime-seconds 900")
+
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        edited = [event for event in kb.list_events(conn, task_id) if event.kind == "edited"]
+    assert output == f"Edited {task_id}"
+    assert task.max_runtime_seconds == 900
+    assert edited[-1].payload == {
+        "fields": ["max_runtime_seconds"],
+        "max_runtime_seconds": 900,
+    }
+
+
+def test_kanban_edit_refuses_runtime_change_while_running(kanban_home):
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="active review", max_runtime_seconds=300)
+        assert kb.claim_task(conn, task_id) is not None
+        assert kb.get_task(conn, task_id).status == "running"
+
+    output = kc.run_slash(f"edit {task_id} --max-runtime-seconds 900")
+
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        edited = [event for event in kb.list_events(conn, task_id) if event.kind == "edited"]
+    assert "cannot edit" in output
+    assert "running task" in output
+    assert task.max_runtime_seconds == 300
+    assert edited == []
+
+
+@pytest.mark.parametrize("value", ["0", "-1", str(kb.MAX_EDIT_RUNTIME_SECONDS + 1), "1.5"])
+def test_kanban_edit_rejects_unbounded_or_nonpositive_runtime(kanban_home, value):
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="blocked review", initial_status="blocked")
+
+    output = kc.run_slash(f"edit {task_id} --max-runtime-seconds {value}")
+
+    assert "usage error" in output
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, task_id).max_runtime_seconds is None
+
+
 def test_worker_link_preserves_foreign_child_rules(kanban_home, monkeypatch):
     with kbc.connect_closing() as conn:
         worker = kb.create_task(conn, title="worker")
@@ -239,5 +288,3 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 # /kanban help / no-args / unknown-action UX (issue #21794)
 # ---------------------------------------------------------------------------
-
-
