@@ -188,7 +188,7 @@
     },
     {
       "name": "bot_relay.outbox.drain",
-      "summary": "Atomically claim every pending cross-connection envelope queued on this gateway.",
+      "summary": "Claim envelopes for currently available target connections; unavailable mail stays queued.",
       "params": [
         {
           "name": "params",
@@ -6694,6 +6694,21 @@
             ],
             "default": null,
             "title": "Profile"
+          },
+          "available_connections": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Available Connections"
           }
         },
         "title": "BotRelayOutboxDrainParams",
@@ -6708,10 +6723,15 @@
             },
             "title": "Envelopes",
             "type": "array"
+          },
+          "deferred": {
+            "title": "Deferred",
+            "type": "boolean"
           }
         },
         "required": [
-          "envelopes"
+          "envelopes",
+          "deferred"
         ],
         "title": "BotRelayOutboxDrainResult",
         "type": "object"

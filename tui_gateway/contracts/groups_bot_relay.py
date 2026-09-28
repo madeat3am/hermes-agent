@@ -518,7 +518,7 @@ method("bot_relay.roster.sync", params=BotRelayRosterSyncParams, result=BotRelay
 
 
 class BotRelayOutboxDrainParams(ProfileParams):
-    pass
+    available_connections: list[str] | None = None
 
 
 class RelayEnvelope(OpenModel):
@@ -536,10 +536,11 @@ class RelayEnvelope(OpenModel):
 
 class BotRelayOutboxDrainResult(Result):
     envelopes: list[RelayEnvelope]
+    deferred: bool
 
 
 method("bot_relay.outbox.drain", params=BotRelayOutboxDrainParams, result=BotRelayOutboxDrainResult,
-       doc="Atomically claim every pending cross-connection envelope queued on this gateway.")
+       doc="Claim envelopes for currently available target connections; unavailable mail stays queued.")
 
 
 class BotRelayDeliverParams(Params):

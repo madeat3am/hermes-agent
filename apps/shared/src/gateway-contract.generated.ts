@@ -1587,9 +1587,11 @@ export interface BotRelayRosterSyncResult {
 }
 export interface BotRelayOutboxDrainParams {
   profile?: string | null
+  available_connections?: string[] | null
 }
 export interface BotRelayOutboxDrainResult {
   envelopes: RelayEnvelope[]
+  deferred: boolean
 }
 /** ``tools/bot_relay.py::enqueue_envelope``. */
 export interface RelayEnvelope {
@@ -4689,7 +4691,7 @@ export interface RpcMethods {
   'billing.step_up': { params: BillingStepUpParams; result: BillingStepUpResult }
   /** Deliver a relayed DM into a Bot Chat on this gateway and return the one-turn reply (blocking). */
   'bot_relay.deliver': { params: BotRelayDeliverParams; result: BotRelayDeliverResult }
-  /** Atomically claim every pending cross-connection envelope queued on this gateway. */
+  /** Claim envelopes for currently available target connections; unavailable mail stays queued. */
   'bot_relay.outbox.drain': { params: BotRelayOutboxDrainParams; result: BotRelayOutboxDrainResult }
   /** Write a relayed reply and/or typed error for an envelope so the sender-side waiter resolves. */
   'bot_relay.reply': { params: BotRelayReplyParams; result: OkResult }

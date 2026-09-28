@@ -329,7 +329,7 @@ def _try_relay_delivery(root: Path, raw_target: str, content: str, me: str, *,
     try:
         from tools.bot_mode_probe import _handle, local_taken_forms
         from tools.bot_relay import (
-            EnvelopeRefusedError, _target_aliases, enqueue_envelope, read_remote_roster, remote_target_forms,
+            _target_aliases, enqueue_envelope, read_remote_roster, remote_target_forms,
             resolve_remote_target, waiter_command,
         )
 
@@ -342,13 +342,7 @@ def _try_relay_delivery(root: Path, raw_target: str, content: str, me: str, *,
             forms = ", ".join(form for r, form in zip(roster, remote_target_forms(roster, local_taken_forms(root)))
                               if want in _target_aliases(r))
             return _err(f"'{raw_target}' exists on several connected machines — disambiguate with one of: {forms}.")
-        try:
-            envelope = enqueue_envelope(root, target=match, message=content, sender_profile=me, sender_handle=_handle(me))
-        except EnvelopeRefusedError as exc:
-            # Fail fast: target definitively offline — nothing was queued.
-            # Structured refusal so the agent can distinguish it from a resolution error ('runtime_offline'
-            # per the #93091 reason enum).
-            return json.dumps({"error": str(exc), "reason": exc.reason})
+        envelope = enqueue_envelope(root, target=match, message=content, sender_profile=me, sender_handle=_handle(me))
         label = f"@{match['handle']} on {match['connection_label'] or match['connection_id']}"
         raw = _spawn_delivery(waiter_command(root, envelope), label, delivery_id=envelope["id"], task_id=task_id, agent=agent)
         waiter_error = json.loads(raw).get("error")

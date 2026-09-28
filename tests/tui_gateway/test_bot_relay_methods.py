@@ -68,8 +68,24 @@ def test_outbox_drain_returns_each_envelope_once(home):
     )
     first = _result(srv._methods["bot_relay.outbox.drain"](1, {}))
     assert [e["id"] for e in first["envelopes"]] == [env["id"]]
+    assert first["deferred"] is False
     second = _result(srv._methods["bot_relay.outbox.drain"](2, {}))
     assert second["envelopes"] == []
+
+
+def test_outbox_drain_defers_an_unavailable_target_until_it_returns(home):
+    target = {"profile": "scout", "handle": "scout", "connection_id": "cloud-1",
+              "connection_label": "", "title": "", "description": ""}
+    env = bot_relay.enqueue_envelope(
+        home, target=target, message="m", sender_profile="default", sender_handle="hermes"
+    )
+    drain = srv._methods["bot_relay.outbox.drain"]
+
+    waiting = _result(drain(1, {"available_connections": ["other"]}))
+    assert waiting == {"envelopes": [], "deferred": True}
+    ready = _result(drain(2, {"available_connections": ["cloud-1"]}))
+    assert [item["id"] for item in ready["envelopes"]] == [env["id"]]
+    assert ready["deferred"] is False
 
 
 def test_outbox_drain_reoffers_a_claimed_envelope_the_desktop_never_delivered(home):

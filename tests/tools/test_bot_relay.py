@@ -504,33 +504,29 @@ def _target(conn="cloud-1", profile="scout", handle="scout"):
             "connection_label": "", "title": "", "description": ""}
 
 
-def test_enqueue_fails_fast_when_row_explicitly_offline(root):
+def test_enqueue_keeps_message_when_row_explicitly_offline(root):
     bot_relay.write_remote_roster(root, [
         {"profile": "scout", "handle": "scout", "connection_id": "cloud-1",
          "online": False},
     ])
     roster = bot_relay.read_remote_roster(root)
     assert roster[0]["online"] is False  # additive field survives normalize
-    with pytest.raises(bot_relay.EnvelopeRefusedError) as ei:
-        bot_relay.enqueue_envelope(
-            root, target=roster[0], message="hi",
-            sender_profile="default", sender_handle="hermes",
-        )
-    assert ei.value.reason == "runtime_offline"
-    assert "offline" in str(ei.value)
-    # nothing was written to the outbox
+    env = bot_relay.enqueue_envelope(
+        root, target=roster[0], message="hi",
+        sender_profile="default", sender_handle="hermes",
+    )
     outdir = bot_relay.relay_root(root) / bot_relay.OUTBOX_DIR
-    assert not outdir.exists() or list(outdir.glob("*.json")) == []
+    assert (outdir / f"{env['id']}.json").exists()
 
 
-def test_enqueue_fails_fast_when_target_absent_from_fresh_roster(root):
+def test_enqueue_keeps_message_when_target_absent_from_fresh_roster(root):
     bot_relay.write_remote_roster(root, _rows())  # fresh, no 'scout' row
-    with pytest.raises(bot_relay.EnvelopeRefusedError) as ei:
-        bot_relay.enqueue_envelope(
-            root, target=_target(), message="hi",
-            sender_profile="default", sender_handle="hermes",
-        )
-    assert ei.value.reason == "runtime_offline"
+    env = bot_relay.enqueue_envelope(
+        root, target=_target(), message="hi",
+        sender_profile="default", sender_handle="hermes",
+    )
+    outdir = bot_relay.relay_root(root) / bot_relay.OUTBOX_DIR
+    assert (outdir / f"{env['id']}.json").exists()
 
 
 def test_enqueue_fails_open_when_liveness_unknown(root):
@@ -558,6 +554,49 @@ def test_enqueue_fails_open_when_liveness_unknown(root):
         sender_profile="default", sender_handle="hermes",
     )
     assert (bot_relay.relay_root(root) / bot_relay.OUTBOX_DIR / f"{env3['id']}.json").exists()
+
+
+def test_drain_leaves_unavailable_target_queued_then_claims_it_once(root):
+    env = bot_relay.enqueue_envelope(
+        root, target=_target(), message="wait for reconnect",
+        sender_profile="default", sender_handle="hermes",
+    )
+    base = bot_relay.relay_root(root)
+
+    claimed, deferred = bot_relay.drain_pending_envelopes(
+        root, available_connections={"another-connection"},
+    )
+    assert claimed == []
+    assert deferred is True
+    assert (base / bot_relay.OUTBOX_DIR / f"{env['id']}.json").exists()
+    assert not (base / bot_relay.CLAIMED_DIR / f"{env['id']}.json").exists()
+
+    claimed, deferred = bot_relay.drain_pending_envelopes(
+        root, available_connections={"cloud-1"},
+    )
+    assert [item["id"] for item in claimed] == [env["id"]]
+    assert deferred is False
+    assert bot_relay.drain_pending_envelopes(
+        root, available_connections={"cloud-1"},
+    ) == ([], False)
+
+
+def test_unavailable_target_still_expires_and_writes_one_reply(root):
+    env = bot_relay.enqueue_envelope(
+        root, target=_target(), message="expired offline",
+        sender_profile="default", sender_handle="hermes",
+    )
+    base = bot_relay.relay_root(root)
+    out_path = base / bot_relay.OUTBOX_DIR / f"{env['id']}.json"
+    env["created_at"] = int(_time2.time()) - bot_relay.DEFAULT_ENVELOPE_TTL_SECONDS - 1
+    out_path.write_text(json.dumps(env), encoding="utf-8")
+
+    assert bot_relay.drain_pending_envelopes(root, available_connections=set()) == ([], False)
+    reply_path = base / bot_relay.REPLIES_DIR / f"{env['id']}.json"
+    first = reply_path.read_text(encoding="utf-8")
+    assert json.loads(first)["reason"] == "queued_expired"
+    assert bot_relay.drain_pending_envelopes(root, available_connections=set()) == ([], False)
+    assert reply_path.read_text(encoding="utf-8") == first
 
 
 def test_drain_expires_old_envelope_with_queued_expired_reply(root):
@@ -644,7 +683,7 @@ def test_invalid_ttl_config_falls_back_instead_of_breaking_drain(monkeypatch):
 
 
 
-def test_message_agent_surfaces_runtime_offline_refusal(tmp_path, monkeypatch):
+def test_message_agent_admits_known_offline_target_once(tmp_path, monkeypatch):
     home = _managed_home(tmp_path)
     bot_relay.write_remote_roster(home, [
         {"profile": "default", "handle": "hermes", "connection_id": "cloud-1",
@@ -656,10 +695,14 @@ def test_message_agent_surfaces_runtime_offline_refusal(tmp_path, monkeypatch):
     )
     agent = _FakeAgent(home)
     out = json.loads(message_agent_tool(target="hermes", message="ping", agent=agent))
-    assert out.get("reason") == "runtime_offline"
-    assert "offline" in out.get("error", "")
-    # fail-fast means no envelope was queued
-    assert bot_relay.claim_pending_envelopes(home) == []
+    assert out.get("status") == "queued"
+    claimed, deferred = bot_relay.drain_pending_envelopes(home, available_connections=set())
+    assert claimed == []
+    assert deferred is True
+    claimed, deferred = bot_relay.drain_pending_envelopes(home, available_connections={"cloud-1"})
+    assert len(claimed) == 1
+    assert claimed[0]["message"].endswith("ping")
+    assert deferred is False
 
 
 # ── delivery turn author (HERMES_TURN_AUTHOR on the recipient turn) ──────────

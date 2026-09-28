@@ -7,8 +7,9 @@ agents on OTHER connections, pushed via ``bot_relay.roster.sync``), ``outbox/``
 (envelopes queued by ``message_agent``, drained via ``bot_relay.outbox.drain``),
 ``replies/`` (one JSON per envelope via ``bot_relay.reply``; a waiter spawned at
 send time watches it so the reply wakes the sender like a local DM).
-Public helpers never raise, except ``enqueue_envelope`` → ``EnvelopeRefusedError``
-when the target is definitively offline (fail fast instead of queueing a DM nobody will drain).
+Public helpers never raise. A message for a known offline target stays in the
+outbox until the Desktop reports that target's connection available, bounded by
+the same queue TTL as every other relay envelope.
 """
 
 from __future__ import annotations
@@ -291,14 +292,12 @@ def _target_liveness(root: Path | str, target: dict) -> Optional[bool]:
 
 
 def enqueue_envelope(root: Path | str, *, target: dict, message: str, sender_profile: str, sender_handle: str) -> dict:
-    """Queue a cross-connection DM for the Desktop relay; returns the envelope. Raises
-    ``EnvelopeRefusedError`` ('runtime_offline') without writing when the target is
-    definitively offline; unknown liveness enqueues (fail-open)."""
-    if _target_liveness(root, target) is False:
-        label = (f"@{target.get('handle') or target.get('profile') or '?'} on "
-                 f"{target.get('connection_label') or target.get('connection_id') or '?'}")
-        raise EnvelopeRefusedError("runtime_offline", f"{label} is offline right now — the message was NOT queued. "
-                                   "Try again once that machine reconnects to the Desktop.")
+    """Queue a cross-connection DM for the Desktop relay; returns the envelope.
+
+    Liveness is advisory at admission time. A target can reconnect during the
+    envelope TTL, so the Desktop supplies its current connection set when it
+    drains and unavailable mail remains queued instead of being refused here.
+    """
     base = _ensure_dirs(root)
     envelope = {
         "id": uuid.uuid4().hex, "created_at": int(time.time()),
@@ -339,8 +338,19 @@ def _queued_at(path: Path) -> tuple[float, str]:
     return (0.0, path.name)
 
 
-def claim_pending_envelopes(root: Path | str) -> list[dict]:
-    """Drain the outbox (rename → claimed/ so a second drain can't double-deliver).
+def drain_pending_envelopes(
+    root: Path | str, *, available_connections: Optional[set[str]] = None,
+) -> tuple[list[dict], bool]:
+    """Claim deliverable outbox entries and report whether unavailable mail remains.
+
+    ``available_connections=None`` preserves the legacy claim-all behavior for
+    callers without a Desktop topology snapshot. When a snapshot is supplied,
+    envelopes for absent target connections stay in ``outbox/`` and therefore
+    remain eligible until their TTL expires. ``deferred`` tells the Desktop to
+    revisit this sender route after it consumed the one-shot outbox signal.
+
+    Claims rename to ``claimed/`` atomically so concurrent drains cannot
+    double-deliver.
     TTL-expired envelopes get a 'queued_expired' reply and are removed instead.
 
     Envelopes older than ``bot_mode.envelope_ttl_seconds`` are NOT delivered: each gets an error reply
@@ -352,7 +362,7 @@ def claim_pending_envelopes(root: Path | str) -> list[dict]:
     ttl = _envelope_ttl_seconds()
     now = time.time()
     # Re-offers first: they are the oldest mail this drain hands out.
-    out: list[dict] = _reoffer_unanswered(root, base, ttl, now)
+    out, deferred = _reoffer_unanswered(root, base, ttl, now, available_connections)
     # Oldest first: the Desktop delivers each target's claimed envelopes in the order this list
     # gives them, so a sender's two DMs to one agent arrive in the order they were sent. Sorting
     # by filename ordered them by ``uuid4().hex`` — at random.
@@ -361,6 +371,17 @@ def claim_pending_envelopes(root: Path | str) -> list[dict]:
             with contextlib.suppress(OSError):
                 path.unlink()
             continue
+        if available_connections is not None:
+            try:
+                queued = json.loads(path.read_text(encoding="utf-8-sig"))
+                target_connection = str(queued.get("target_connection") or "") if isinstance(queued, dict) else ""
+            except (OSError, ValueError):
+                target_connection = ""
+            # Invalid envelopes keep the legacy claim path below, where result
+            # validation exposes them instead of leaving an immortal file.
+            if target_connection and target_connection not in available_connections:
+                deferred = True
+                continue
         claimed = base / CLAIMED_DIR / path.name
         with contextlib.suppress(OSError, ValueError):
             os.replace(path, claimed)  # atomic claim
@@ -369,10 +390,21 @@ def claim_pending_envelopes(root: Path | str) -> list[dict]:
             if not isinstance(envelope, dict):
                 raise ValueError(f"expected a JSON object, got {type(envelope).__name__}")
             out.append(envelope)
-    return out
+    return out, deferred
 
 
-def _reoffer_unanswered(root: Path | str, base: Path, ttl: float, now: float) -> list[dict]:
+def claim_pending_envelopes(root: Path | str) -> list[dict]:
+    """Compatibility claim-all wrapper for non-Desktop callers and tests."""
+    return drain_pending_envelopes(root)[0]
+
+
+def _reoffer_unanswered(
+    root: Path | str,
+    base: Path,
+    ttl: float,
+    now: float,
+    available_connections: Optional[set[str]] = None,
+) -> tuple[list[dict], bool]:
     """``claimed/`` envelopes unanswered ``REOFFER_AFTER_SECONDS`` after their claim, at most once each.
 
     The claim is the Desktop's: one that disconnects between ``outbox.drain`` and ``bot_relay.deliver``
@@ -388,6 +420,7 @@ def _reoffer_unanswered(root: Path | str, base: Path, ttl: float, now: float) ->
       later than that refuses it with ``queued_expired``.
     """
     out: list[dict] = []
+    deferred = False
     for path in sorted((base / CLAIMED_DIR).glob("*.json"), key=_queued_at):
         if (base / REPLIES_DIR / path.name).exists():
             continue
@@ -414,10 +447,14 @@ def _reoffer_unanswered(root: Path | str, base: Path, ttl: float, now: float) ->
                     f"re-queued message to {label} expired after {ttl}s waiting for the Desktop to drain it "
                     "again — it was NOT delivered. Resend once the Desktop reconnects."))
                 continue
+            target_connection = str(envelope.get("target_connection") or "")
+            if available_connections is not None and target_connection and target_connection not in available_connections:
+                deferred = True
+                continue
             envelope["reoffered_at"] = int(now)
             _atomic_write_json(path, envelope)
             out.append(envelope)
-    return out
+    return out, deferred
 
 
 def write_reply(root: Path | str, envelope_id: str, *, reply: str = "", error: str = "", reason: str = "") -> Path:
