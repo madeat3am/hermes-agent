@@ -31,8 +31,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-# Top-level imports stay stdlib-only: this module also runs directly as the background
-# delivery runner (``python bot_mode_dm.py --run-delivery …``); Hermes helpers import lazily.
+# Top-level imports stay stdlib-only: this module also runs as the background delivery
+# runner through the installation launcher; Hermes helpers import lazily.
 
 logger = logging.getLogger(__name__)
 
@@ -585,18 +585,28 @@ def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool,
                       profile_home: Path | None = None, author: Optional[dict] = None) -> str:
     """Build an argv-safe command for the cleanup-owning background runner:
     ``--run-delivery [--author <json>] <mode> <dm_file> [--profile-home <path>] <argv...>``."""
-    runner_argv = [sys.executable, str(Path(__file__).resolve()), "--run-delivery",
-                   "stdin" if stdin_file else "query-file", dm_file]
+    runner_args = ["--run-delivery", "stdin" if stdin_file else "query-file", dm_file]
     if profile_home is not None:
-        runner_argv.extend(["--profile-home", str(Path(profile_home).resolve())])
-    runner_argv.extend(argv)
+        runner_args.extend(["--profile-home", str(Path(profile_home).resolve())])
+    runner_args.extend(argv)
+    # A managed source install runs its store Python in isolated mode; only the
+    # installation launcher activates the selected dependency generation.  A
+    # raw ``sys.executable bot_mode_dm.py`` child therefore cannot import the
+    # Hermes helpers used by ``_run_delivery`` (for example ruamel.yaml).
+    from hermes_cli._launchers import installation_command
+
+    runner_argv = installation_command(
+        Path(__file__).resolve().parents[1], runner_args, module="tools.bot_mode_dm")
     if sys.platform == "win32":
         # The tracked local backend uses Git Bash on native Windows: forward slashes keep drive
         # paths executable there; backslash paths are parsed as command names (exit 127).
         runner_argv = [part.replace("\\", "/") for part in runner_argv]
     if author:
-        # Inserted after the slash rewrite: JSON escapes are backslashes too.
-        runner_argv[3:3] = ["--author", json.dumps(author, separators=(",", ":"))]
+        # Inserted after the slash rewrite: JSON escapes are backslashes too.  The managed
+        # launcher has a variable-length prefix, so anchor on the runner's own argument.
+        marker = runner_argv.index("--run-delivery")
+        runner_argv[marker + 1:marker + 1] = [
+            "--author", json.dumps(author, separators=(",", ":"))]
     return shlex.join(runner_argv)
 
 

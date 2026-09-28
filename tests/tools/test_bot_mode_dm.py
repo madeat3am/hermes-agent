@@ -256,6 +256,31 @@ def _runner_author(command):
     return json.loads(parts[marker + 2])
 
 
+def test_delivery_command_uses_installation_bound_launcher(tmp_path, monkeypatch):
+    """The runner must activate the managed dependency generation before importing Hermes helpers."""
+    captured = {}
+
+    def fake_installation_command(repo_root, args=(), *, module="hermes_cli.main", **_kwargs):
+        captured.update(repo_root=Path(repo_root), args=list(args), module=module)
+        return [str(tmp_path / "managed hermes"), "--run-module", module, *args]
+
+    monkeypatch.setattr("hermes_cli._launchers.installation_command", fake_installation_command)
+    dm_file = tmp_path / "message.txt"
+    command = bot_mode_dm._delivery_command(
+        ["hermes", "-p", "researcher"], str(dm_file), stdin_file=False,
+        author={"id": "bot:default", "name": "hermes", "is_bot": True},
+    )
+
+    parts = shlex.split(command)
+    assert captured == {
+        "repo_root": Path(bot_mode_dm.__file__).resolve().parents[1],
+        "args": ["--run-delivery", "query-file", str(dm_file), "hermes", "-p", "researcher"],
+        "module": "tools.bot_mode_dm",
+    }
+    assert parts[:3] == [str(tmp_path / "managed hermes"), "--run-module", "tools.bot_mode_dm"]
+    assert _runner_author(command) == {"id": "bot:default", "name": "hermes", "is_bot": True}
+
+
 def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
     calls = _capture_spawn(monkeypatch)
     # These assertions target the -p/turn-args shape; pin the entrypoint resolution
