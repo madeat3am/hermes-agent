@@ -1545,39 +1545,44 @@ def test_connect_heals_reduced_tasks_schema_seeded_by_external_harness(kanban_ho
 # launchd jobs, and other detached processes routinely run with a stripped
 # $PATH that doesn't include the venv's bin/, so a bare `["hermes", ...]`
 # spawn fails with FileNotFoundError and the task gets stuck. The resolver
-# prefers the interpreter-bound module form (exactly this install; a PATH
-# shim could be attacker-planted or belong to another install, #111569) and
-# only falls back to the PATH shim when ``hermes_cli`` is not importable.
+# prefers this source installation's managed launcher (a PATH shim could be
+# attacker-planted or belong to another install, #111569) and only falls back
+# to the PATH shim when ``hermes_cli`` is not importable.
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
+def test_resolve_hermes_argv_prefers_managed_installation_over_path_shim(monkeypatch):
     """A `hermes` on PATH must not shadow the running install (#111569):
-    the module argv wins whenever ``hermes_cli`` is importable; only an
+    the managed launcher wins whenever ``hermes_cli`` is importable; only an
     explicit ``$HERMES_BIN`` overrides it."""
     import shutil
-    import sys
     from hermes_cli import kanban_db_dispatch as kbd
+
+    calls = []
+
+    def fake_installation_command(repo_root):
+        calls.append(repo_root)
+        return ["/opt/hermes/.hermes/bin/hermes"]
 
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: "/tmp/planted/hermes")
     monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
-    assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
+    monkeypatch.setattr(kbd, "installation_command", fake_installation_command)
+    assert kbd._resolve_hermes_argv() == ["/opt/hermes/.hermes/bin/hermes"]
+    assert calls == [Path(kbd.__file__).resolve().parents[1]]
 
     monkeypatch.setenv("HERMES_BIN", "/opt/hermes/bin/hermes")
     assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
+    assert len(calls) == 1
 
 
 
 
-def test_resolve_hermes_argv_module_actually_runs():
-    """The fallback module name must be importable + runnable.
+def test_resolve_hermes_argv_external_install_fallback_actually_runs(monkeypatch, tmp_path):
+    """The external-install fallback must be importable + runnable.
 
-    A unit test that pins the literal string is necessary but not
-    sufficient — if `hermes_cli.main` ever loses `if __name__ == "__main__"`
-    handling or its argparse setup, `python -m hermes_cli.main --version`
-    would fail and so would every dispatcher spawn that hits the fallback.
-    Run it as a real subprocess to catch that regression.
+    Force ``installation_command`` to its runtime-command branch so the test
+    remains independent of a developer machine's managed Hermes home.
     """
     import subprocess
     from hermes_cli import kanban_db_dispatch as kbd
@@ -1586,9 +1591,11 @@ def test_resolve_hermes_argv_module_actually_runs():
 
     with mock.patch.dict(os.environ, {}, clear=False):
         os.environ.pop("HERMES_BIN", None)
+        monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "empty-runtime"))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
         with mock.patch.object(shutil, "which", return_value=None):
             argv = kbd._resolve_hermes_argv()
-    r = subprocess.run(argv + ["--version"], capture_output=True, text=True, timeout=30)
+        r = subprocess.run(argv + ["--version"], capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, (
         f"`{' '.join(argv)} --version` failed (rc={r.returncode}); "
         f"stderr={r.stderr[:200]!r}"
