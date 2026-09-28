@@ -500,16 +500,20 @@ def waiter_command(root: Path | str, envelope: dict) -> str:
 
 
 def _hermes_cli() -> str:
-    """hermes CLI beside this interpreter, then ``shutil.which``, then the bare name
-    (service contexts lack PATH, so a bare "hermes" died with ENOENT).
+    """This source installation's managed CLI, then the interpreter sibling,
+    ``shutil.which``, and finally the bare name.
 
-    The deliver RPC runs on the target gateway, whose process is the venv python — its bin/Scripts directory
-    holds the matching ``hermes`` entrypoint. A bare ``"hermes"`` relies on PATH, which is exactly what
-    service contexts (systemd units, desktop launchers, non-login SSH shells) do not provide, so delivery
-    died with ENOENT there (#93590). When no sibling exists (e.g. running from a source tree without an
-    installed script), a ``shutil.which`` lookup runs next — it honors whatever PATH the process does have —
-    before falling back to the bare name, preserving today's behavior for interactive shells.
+    A managed gateway runs the immutable store Python directly, so the interpreter's
+    sibling is not the published Hermes command. ``installation_command`` resolves the
+    install-bound wrapper that activates the selected dependency generation. External
+    and developer installs return a multi-element runtime command; those keep the
+    existing sibling/PATH fallback because callers require one CLI argv element.
     """
+    from hermes_cli._launchers import installation_command
+
+    managed = installation_command(Path(__file__).resolve().parents[1])
+    if len(managed) == 1:
+        return managed[0]
     sibling = Path(sys.executable or "").parent / ("hermes.exe" if sys.platform == "win32" else "hermes")
     return str(sibling) if sibling.is_file() else shutil.which("hermes") or "hermes"
 
