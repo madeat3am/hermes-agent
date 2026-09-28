@@ -58,6 +58,24 @@ def test_local_delivery_resolves_sibling_hermes(tmp_path, monkeypatch):
     assert argv[argv.index("--query-file") + 1] == "query.json"
 
 
+def test_local_delivery_prefers_installation_bound_hermes(tmp_path, monkeypatch):
+    managed = tmp_path / ".hermes" / "bin" / "hermes"
+    captured = {}
+
+    def fake_installation_command(repo_root):
+        captured["repo_root"] = Path(repo_root)
+        return [str(managed)]
+
+    monkeypatch.setattr("hermes_cli._launchers.installation_command", fake_installation_command)
+    monkeypatch.setattr(bot_relay.shutil, "which", lambda _name: "/ambient/hermes")
+
+    argv = bot_relay.local_delivery_command("ops", "query.json")
+
+    assert captured["repo_root"] == Path(bot_relay.__file__).resolve().parents[1]
+    assert argv[0] == str(managed)
+    assert argv[1:3] == ["-p", "ops"]
+
+
 def test_local_delivery_uses_shutil_which_when_no_sibling(tmp_path, monkeypatch):
     """Without a venv sibling, a PATH hit (shutil.which) wins next —
     interactive shells keep resolving exactly what they resolve today."""
