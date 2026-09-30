@@ -415,6 +415,9 @@ def _apply_output_hooks(
         if isinstance(_hook_result, str) and _hook_result:
             pre_transform, final_response, transformed = final_response, _hook_result, True
             break
+    # Guarded turns notify only after the outer facade seals the final payload.
+    if getattr(agent, "_required_output_release_policy", None) is not None:
+        return final_response, transformed, pre_transform
     # post_llm_call (e.g. sync conversation data to an external memory system).
     _invoke_hook_safely(
         "post_llm_call", logger,
@@ -599,10 +602,11 @@ def finalize_turn(
         agent._iters_since_skill = 0
 
     # External memory provider: sync the completed turn + queue next prefetch.
-    agent._sync_external_memory_for_turn(
-        original_user_message=original_user_message, final_response=final_response,
-        interrupted=interrupted, messages=messages,
-    )
+    if getattr(agent, "_required_output_release_policy", None) is None:
+        agent._sync_external_memory_for_turn(
+            original_user_message=original_user_message, final_response=final_response,
+            interrupted=interrupted, messages=messages,
+        )
 
     # Background memory/skill review runs AFTER delivery so it never competes with the
     # user's task. Suppressed by skip_background_review (e.g. cron): the fork costs

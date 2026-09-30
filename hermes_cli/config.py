@@ -27,6 +27,7 @@ from hermes_cli.cli_output import line_input
 from hermes_cli.colors import Colors, color
 from hermes_cli import managed_scope
 from hermes_cli.default_soul import DEFAULT_SOUL_MD, is_legacy_template_soul
+from hermes_cli.env_transaction import env_transaction, require_env_transaction
 from hermes_cli.secret_prompt import masked_secret_prompt
 # Re-export from hermes_constants — canonical definition lives there.
 from hermes_constants import get_hermes_home, get_process_hermes_home  # noqa: F401
@@ -2392,19 +2393,19 @@ def _sanitize_env_lines(lines: list) -> list:
 
 def sanitize_env_file() -> int:
     """Rewrite ~/.hermes/.env with normalized line formatting; returns the number of changed lines."""
-    env_path = get_env_path()
-    if not env_path.exists():
-        return 0
-    with open(env_path, encoding="utf-8-sig", errors="replace") as f:
-        original_lines = f.readlines()
-    sanitized = _sanitize_env_lines(original_lines)
-    if sanitized == original_lines:
-        return 0
-    fixes = abs(len(sanitized) - len(original_lines)) or sum(
-        1 for a, b in zip(original_lines, sanitized) if a != b)
-    _write_env_lines(env_path, sanitized, preserve_mode=False)
-    invalidate_env_cache()
-    return fixes
+    with env_transaction(get_env_path()) as env_path:
+        if not env_path.exists():
+            return 0
+        with open(env_path, encoding="utf-8-sig", errors="replace") as f:
+            original_lines = f.readlines()
+        sanitized = _sanitize_env_lines(original_lines)
+        if sanitized == original_lines:
+            return 0
+        fixes = abs(len(sanitized) - len(original_lines)) or sum(
+            1 for a, b in zip(original_lines, sanitized) if a != b)
+        _write_env_lines(env_path, sanitized, preserve_mode=False)
+        invalidate_env_cache()
+        return fixes
 
 
 def _read_env_lines(env_path: Path) -> list:
@@ -2418,6 +2419,7 @@ def _write_env_lines(env_path: Path, lines: list, *, preserve_mode: bool) -> Non
     """Atomically replace ``.env`` (tmp file + fsync + rename).
     ``preserve_mode`` keeps the original file mode (e.g. 0640 for Docker volume mounts) instead of
     letting ``_secure_file`` tighten to 0600; a new file is always secured."""
+    env_path = require_env_transaction(env_path)
     original_mode = None
     try:
         original_mode = stat.S_IMODE(env_path.stat().st_mode) if preserve_mode else None
@@ -2428,6 +2430,8 @@ def _write_env_lines(env_path: Path, lines: list, *, preserve_mode: bool) -> Non
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.writelines(lines)
             f.flush()
+            if original_mode is not None:
+                os.fchmod(f.fileno(), original_mode)
             os.fsync(f.fileno())
         atomic_replace(tmp_path, env_path)
     except BaseException:
@@ -2436,13 +2440,13 @@ def _write_env_lines(env_path: Path, lines: list, *, preserve_mode: bool) -> Non
         except OSError:
             pass
         raise
-    if original_mode is not None:
-        try:
-            os.chmod(env_path, original_mode)
-        except OSError:
-            pass
-    else:
+    if original_mode is None:
         _secure_file(env_path)
+    directory_fd = os.open(env_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def _check_non_ascii_credential(key: str, value: str) -> str:
@@ -2554,22 +2558,21 @@ def save_env_value(key: str, value: str):
     value = value.replace("\n", "").replace("\r", "")
     value = _check_non_ascii_credential(key, value)
     ensure_hermes_home()
-    env_path = get_env_path()
+    with env_transaction(get_env_path()) as env_path:
+        lines = _read_env_lines(env_path) if env_path.exists() else []
+        serialized_value = _quote_env_value(value)
 
-    lines = _read_env_lines(env_path) if env_path.exists() else []
-    serialized_value = _quote_env_value(value)
+        idx = next((i for i, line in enumerate(lines) if _env_line_defines_key(line, key)), None)
+        if idx is not None:
+            lines[idx] = f"{key}={serialized_value}\n"
+        else:
+            if lines and not lines[-1].endswith("\n"):
+                lines[-1] += "\n"
+            lines.append(f"{key}={serialized_value}\n")
 
-    idx = next((i for i, line in enumerate(lines) if _env_line_defines_key(line, key)), None)
-    if idx is not None:
-        lines[idx] = f"{key}={serialized_value}\n"
-    else:
-        if lines and not lines[-1].endswith("\n"):
-            lines[-1] += "\n"
-        lines.append(f"{key}={serialized_value}\n")
-
-    _write_env_lines(env_path, lines, preserve_mode=env_path.exists())
-    _publish_env_value(key, value)
-    invalidate_env_cache()
+        _write_env_lines(env_path, lines, preserve_mode=env_path.exists())
+        _publish_env_value(key, value)
+        invalidate_env_cache()
 
 
 def custom_endpoint_key_env(identity: str) -> str:
@@ -2587,19 +2590,19 @@ def remove_env_value(key: str) -> bool:
         return False
     if not _ENV_VAR_NAME_RE.match(key):
         raise ValueError(f"Invalid environment variable name: {key!r}")
-    env_path = get_env_path()
-    if not env_path.exists():
-        _publish_env_value(key, None)
-        return False
+    with env_transaction(get_env_path()) as env_path:
+        if not env_path.exists():
+            _publish_env_value(key, None)
+            return False
 
-    lines = _read_env_lines(env_path)
-    new_lines = [line for line in lines if not _env_line_defines_key(line, key)]
-    found = len(new_lines) < len(lines)
-    if found:
-        _write_env_lines(env_path, new_lines, preserve_mode=True)
-    _publish_env_value(key, None)
-    invalidate_env_cache()
-    return found
+        lines = _read_env_lines(env_path)
+        new_lines = [line for line in lines if not _env_line_defines_key(line, key)]
+        found = len(new_lines) < len(lines)
+        if found:
+            _write_env_lines(env_path, new_lines, preserve_mode=True)
+        _publish_env_value(key, None)
+        invalidate_env_cache()
+        return found
 
 
 def _write_anthropic_slots(token: str, api_key: str, save_fn=None, *, token_first: bool = True):

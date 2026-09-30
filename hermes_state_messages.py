@@ -99,7 +99,10 @@ def _stale_holder(row, now: float) -> bool:
     return float(row["expires_at"]) <= now or _compression_lock_holder_process_is_dead(row["holder"])
 
 
-class SessionMessagesMixin:
+from hermes_state_output_release import SessionOutputReleaseMixin
+
+
+class SessionMessagesMixin(SessionOutputReleaseMixin):
     """Message append/replace/rewind, reactions, resume conversations, replay dedupe."""
 
     def _bump_conversation_generation(self, conn, session_id: str, end_reason: str) -> None:
@@ -300,7 +303,7 @@ class SessionMessagesMixin:
         def _do(conn):
             self._check_transcript_write_guards(conn, session_id, compression_lock_holder,
                 turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
-            msg_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
+            msg_id = self._insert_public_message(conn, _INSERT_MESSAGE_SQL, params, msg).lastrowid
             self._bump_session_counters(conn, session_id, 1, _tool_calls_count(tool_calls), unit=True)
             return msg_id
         # THE critical write (failure aborts the turn): long patience so a sibling legitimately
@@ -333,7 +336,7 @@ class SessionMessagesMixin:
             if existing is not None:
                 return existing[0]
             self._check_transcript_write_guards(conn, session_id, None, reject_active_turn_lease=True)
-            msg_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
+            msg_id = self._insert_public_message(conn, _INSERT_MESSAGE_SQL, params, msg).lastrowid
             self._bump_session_counters(conn, session_id, 1, 0, unit=True)
             return msg_id
 
@@ -476,8 +479,8 @@ class SessionMessagesMixin:
             role = msg.get("role", "unknown")
             tool_calls = _parse_tool_calls(msg.get("tool_calls"))
             message_timestamp = _coerce_timestamp(msg.get("timestamp"), now_ts)
-            cur = conn.execute(_INSERT_MESSAGE_SQL, self._message_row_params(
-                session_id, role, msg, tool_calls, message_timestamp, keep_reasoning=role == "assistant"))
+            cur = self._insert_public_message(conn, _INSERT_MESSAGE_SQL, self._message_row_params(
+                session_id, role, msg, tool_calls, message_timestamp, keep_reasoning=role == "assistant"), msg)
             if cur.lastrowid is not None:
                 msg["_row_id"] = cur.lastrowid
             inserted += 1
@@ -766,7 +769,7 @@ class SessionMessagesMixin:
 
     def get_messages(self, session_id: str, include_inactive: bool = False, include_compacted: bool = False,
                      limit: Optional[int] = None, offset: int = 0, latest: bool = False,
-                     after_id: Optional[int] = None) -> List[Dict[str, Any]]:
+                     after_id: Optional[int] = None, trusted_raw: bool = False) -> List[Dict[str, Any]]:
         """Load messages in insertion order (id, never timestamp: clocks regress). ``include_inactive``:
         rewind rows too; ``include_compacted``: compaction-archived display history (not rewind rows).
         ``latest`` pages back from the newest but returns chronological order; ``after_id``: keyset paging."""
@@ -809,6 +812,8 @@ class SessionMessagesMixin:
             rows = self._read_all(sql, params)
             if latest:
                 rows.reverse()
+        if trusted_raw:
+            rows = self._restore_output_raw_rows(rows)
         return [self._row_to_message_dict(row, warn_context="get_messages", summary_flag=True) for row in rows]
 
     def find_pr_url_messages(self, session_ids: List[str]) -> List[Dict[str, Any]]:
@@ -893,7 +898,7 @@ class SessionMessagesMixin:
     def get_messages_as_conversation(self, session_id: str, include_ancestors: bool = False,
                                      include_inactive: bool = False, repair_alternation: bool = False,
                                      include_row_ids: bool = False,
-                                     include_compacted: bool = False) -> List[Dict[str, Any]]:
+                                     include_compacted: bool = False, trusted_raw: bool = False) -> List[Dict[str, Any]]:
         """Load messages in OpenAI format. ``include_compacted`` (deduped display history) is for DISPLAY reads
         only: the model-fed restore must not regrow what compaction summarized away. ``repair_alternation``
         repairs the loaded list for LIVE REPLAY callers (a durable ``user;user`` pair would re-trigger the
@@ -904,6 +909,8 @@ class SessionMessagesMixin:
             self._active_clause(include_inactive, include_compacted), with_session_id=False)
         if include_compacted:
             rows = self._dedupe_display_generations(rows)
+        if trusted_raw:
+            rows = self._restore_output_raw_rows(rows)
         return self._rows_to_conversation(rows, session_id=session_id, include_ancestors=include_ancestors,
             repair_alternation=repair_alternation, include_row_ids=include_row_ids,
             include_summary_markers=repair_alternation)

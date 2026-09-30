@@ -16,9 +16,29 @@ from agent.lazy_forward import forward as _forward
 logger = logging.getLogger("run_agent")
 
 
+def _with_public_exception_boundary(fn):
+    """Cover admission and outer-finally failures as well as the loop body."""
+    from functools import wraps
+
+    @wraps(fn)
+    def guarded(self, *args, **kwargs):
+        try:
+            return fn(self, *args, **kwargs)
+        except BaseException:
+            if getattr(self, "_required_output_release_policy", None) is None:
+                raise
+            from agent.output_release import public_result
+            turn = getattr(self, "_output_release_turn", None)
+            if turn is not None:
+                turn.closed = True
+            return public_result()
+    return guarded
+
+
 class TurnFacadeMixin:
     """run_conversation()/chat() (see module docstring)."""
 
+    @_with_public_exception_boundary
     def run_conversation(
         self, user_message: Any, system_message: str=None,
         conversation_history: List[Dict[str, Any]]=None, task_id: str=None,
@@ -70,6 +90,9 @@ class TurnFacadeMixin:
         # the finally resets each one unconditionally.
         token = affinity_token = acct_token = None
         task_started = task_finished = False
+        from agent.output_release import ReleaseTurn, public_result
+        required_policy = getattr(self, "_required_output_release_policy", None)
+        release = None
         relay_outcome = "failed"
 
         try:
@@ -83,9 +106,21 @@ class TurnFacadeMixin:
                 relay_outcome = (
                     "cancelled" if admission.early_result.get("interrupted") else "timed_out"
                 )
-                return admission.early_result
+                return public_result() if required_policy is not None else admission.early_result
             lease = admission.lease
             conversation_history = admission.conversation_history
+            if required_policy is not None:
+                release = ReleaseTurn(self, required_policy, effective_task_id, relay_turn_id, user_message)
+                self._output_release_turn = release
+                if not release.prepare(user_message):
+                    return public_result()
+                if getattr(self, "_output_release_pending_context_start", False):
+                    from agent.agent_init import _start_context_engine_session
+                    _start_context_engine_session(self)
+                    self._output_release_pending_context_start = False
+                # Caller-facing notices must never be fed back as model context.
+                conversation_history = self._session_db.get_messages_as_conversation(
+                    session_id, trusted_raw=True)
 
             relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
                 profile_key=relay_runtime.current_profile_key(),
@@ -134,6 +169,8 @@ class TurnFacadeMixin:
                     # the interrupt clear itself waits for the thread join in the outer finally.
                     if lease is not None:
                         lease.stop_refresher()
+            if release is not None:
+                result = release.finish(result if isinstance(result, dict) else {})
             terminal = result if isinstance(result, dict) else {}
             relay_outcome = (
                 "cancelled" if terminal.get("interrupted") is True
@@ -158,9 +195,13 @@ class TurnFacadeMixin:
                 )
             if task_started and not task_finished:
                 task_finished = True
-                finish_task_run(**task_context, error=exc)
+                finish_task_run(**task_context, error=RuntimeError("Output withheld.") if required_policy is not None else exc)
+            if required_policy is not None:
+                return public_result()
             raise
         finally:
+            if release is not None:
+                release.closed = True
             try:
                 if relay_turn is not None:
                     relay_runtime.SESSION_COORDINATOR.end_turn(relay_turn, outcome=relay_outcome)

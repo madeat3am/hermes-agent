@@ -19,6 +19,9 @@ class StatusOutputMixin:
     def _safe_print(self, *args, **kwargs):
         """Print that swallows broken pipes / closed stdout (headless stdout can vanish mid-session);
         routes through ``self._print_fn`` so the CLI can inject an ANSI-aware renderer."""
+        from agent.output_release import guarded
+        if guarded(self):
+            return
         try:
             (self._print_fn or print)(*args, **kwargs)
         except (OSError, ValueError):

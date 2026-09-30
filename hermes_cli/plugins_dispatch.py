@@ -180,6 +180,11 @@ class PluginDispatchMixin:
         closed with a block directive, others skip. ``_HOOK_CALLER_THREAD_HOOKS`` always run on the
         caller thread. ``pre_llm_call`` may return ``{"context": "..."}`` (or a str) to inject.
         """
+        from agent.output_release import guarded
+        from agent.subagent_lifecycle import get_active_subagent_parent
+        if (hook_name in {"pre_api_request", "post_api_request", "post_tool_call"}
+                and guarded(get_active_subagent_parent())):
+            return []
         from hermes_cli.plugins import _resolve_hook_callback_timeout
         # Gateway platform events define event-local envelopes; a bus-wide version here would turn
         # unrelated adapter payloads into one monolithic compatibility contract.

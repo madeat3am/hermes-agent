@@ -731,7 +731,7 @@ class SessionSessionsMixin:
         """Persisted YOLO flag; False on any parse failure (resume must never enable the bypass)."""
         return bool(_parse_model_config((session_meta or {}).get("model_config")).get("yolo_mode"))
 
-    def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+    def get_session(self, session_id: str, *, trusted_raw=False) -> Optional[Dict[str, Any]]:
         """Get a session by ID (drains queued token deltas first so cost readers see exact totals)."""
         self.flush_token_counts()
         row = self._read_one(
@@ -739,7 +739,7 @@ class SessionSessionsMixin:
             "FROM sessions s LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash WHERE s.id = ?",
             (session_id,),
         )
-        return self._session_row_dict(row) if row else None
+        return self._session_row_dict(row, trusted_raw=trusted_raw) if row else None
 
     def get_dominant_session_model_route(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Main-loop model route that served most API calls (``session_model_usage`` keeps the coherent

@@ -234,7 +234,8 @@ class SessionPortabilityMixin:
     # ── Export ─────────────────────────────────────────────────────────────
 
     def _with_messages(self, session: Dict[str, Any]) -> Dict[str, Any]:
-        return {**session, "messages": self.get_messages(session["id"])}
+        return {**session, "messages": [{k: v for k, v in msg.items() if k != "output_raw_id"}
+                                      for msg in self.get_messages(session["id"])]}
 
     def export_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Export a single session with all its messages as a dict."""
@@ -461,6 +462,10 @@ class SessionPortabilityMixin:
             **{col: self._coerce_or(raw.get(col), int, 0) for col in _IMPORT_INT_COLS},
         }
         conn.execute(_IMPORT_SESSION_INSERT_SQL, params)
+        if raw.get("output_guarded"):
+            conn.execute("UPDATE sessions SET output_guarded=1 WHERE id=?", (session_id,))
+            conn.execute("INSERT INTO output_release_turns VALUES (?, ?, ?, 0)",
+                         (session_id, "import-guard", "{}"))
         def _json_value(value: Any) -> Any:
             return safe_json_loads(value, default=value) if isinstance(value, str) else value
         sanitized_messages = [

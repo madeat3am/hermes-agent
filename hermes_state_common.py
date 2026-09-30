@@ -194,7 +194,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
         f"(SELECT started_at FROM sessions _act_s WHERE _act_s.id = {session_id_expr})")
 
 
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 31
 
 # Auto-maintenance VACUUMs only above this freelist fraction; below it a rewrite costs more I/O than it returns.
 # Auto-maintenance only VACUUMs when at least this fraction of the database file is reclaimable (``PRAGMA
@@ -335,6 +335,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     hidden INTEGER NOT NULL DEFAULT 0,
     last_read_at REAL,
     tool_names TEXT,
+    output_guarded INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id),
     FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
 );
@@ -365,7 +366,34 @@ CREATE TABLE IF NOT EXISTS messages (
     display_kind TEXT,
     display_metadata TEXT,
     display_identity BLOB,
-    display_order INTEGER
+    display_order INTEGER,
+    output_raw_id TEXT
+);
+CREATE TABLE IF NOT EXISTS output_release_turns (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_id TEXT NOT NULL,
+    binding TEXT NOT NULL,
+    start_message_id INTEGER NOT NULL,
+    PRIMARY KEY (session_id, turn_id)
+);
+CREATE TABLE IF NOT EXISTS output_release_raw (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS output_release_candidates (
+    candidate_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_id TEXT NOT NULL,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    binding TEXT NOT NULL,
+    payload_digest TEXT NOT NULL,
+    raw_payload TEXT NOT NULL,
+    public_text TEXT NOT NULL,
+    published INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(session_id, turn_id)
 );
 
 CREATE TABLE IF NOT EXISTS session_model_usage (

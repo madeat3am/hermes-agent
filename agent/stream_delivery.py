@@ -19,6 +19,12 @@ logger = logging.getLogger("run_agent")
 class StreamDeliveryMixin:
     """Stream ownership, delta/reasoning hook fan-out and interim-text dedup (see module docstring)."""
 
+    def __setattr__(self, name, value):
+        from agent.output_release import MANAGED_CALLBACKS, guarded_sink, guarded
+        if name in MANAGED_CALLBACKS and callable(value) and guarded(self):
+            value = guarded_sink(self, value)
+        super().__setattr__(name, value)
+
     @staticmethod
     def _call_quietly(cb, *args) -> bool:
         """Call ``cb(*args)`` if set, swallowing errors; True when it ran without raising."""
@@ -32,11 +38,15 @@ class StreamDeliveryMixin:
 
     def _deliver_to_stream_callbacks(self, text: str) -> bool:
         """Send ``text`` to the display + TTS delta callbacks; True if at least one accepted it."""
+        if getattr(self, "_required_output_release_policy", None) is not None:
+            return False
         results = [self._call_quietly(cb, text) for cb in (self.stream_delta_callback, self._stream_callback)]
         return any(results)
 
     def _enqueue_stream_hook(self, event: str, *, label: str | None = None, **fields: Any) -> None:
         """Best-effort plugin stream hook enqueue; never raises into the stream path."""
+        if getattr(self, "_required_output_release_policy", None) is not None:
+            return
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
 
@@ -162,6 +172,8 @@ class StreamDeliveryMixin:
 
     def _deliver_interim(self, visible: str, *, already_streamed: bool, record: List[str]) -> None:
         """Hand ``visible`` to ``interim_assistant_callback`` and mark ``record`` delivered; swallows callback errors."""
+        if getattr(self, "_required_output_release_policy", None) is not None:
+            return
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None:
             return
@@ -312,7 +324,7 @@ class StreamDeliveryMixin:
             return
         delivered = self._deliver_to_stream_callbacks(text)
         self._enqueue_stream_hook("on_stream_delta", delta=text, kind="text")
-        if delivered:
+        if delivered or getattr(self, "_required_output_release_policy", None) is not None:
             self._record_streamed_assistant_text(text)
 
     def _fire_reasoning_delta(self, text: str) -> None:
@@ -321,6 +333,8 @@ class StreamDeliveryMixin:
             # Single-writer guard (#65991): fence out a superseded stream's reasoning deltas the same way as
             # content deltas.
             self._note_dropped_stream_writer("_fire_reasoning_delta")
+            return
+        if getattr(self, "_required_output_release_policy", None) is not None:
             return
         self._call_quietly(self.reasoning_callback, text)
         try:
@@ -335,6 +349,8 @@ class StreamDeliveryMixin:
 
     def _fire_tool_gen_started(self, tool_name: str) -> None:
         """Notify the display layer that the model is generating tool call arguments (spinner for large payloads)."""
+        if getattr(self, "_required_output_release_policy", None) is not None:
+            return
         self._call_quietly(self.tool_gen_callback, tool_name)
 
     def _has_stream_consumers(self) -> bool:

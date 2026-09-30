@@ -129,12 +129,12 @@ class SessionTitlesMixin:
 
     def get_session_title(self, session_id: str) -> Optional[str]:
         """Get the title for a session, or None."""
-        row = self._read_one("SELECT title FROM sessions WHERE id = ?", (session_id,))
+        row = self._read_one("SELECT title FROM sessions WHERE id = ? AND output_guarded=0", (session_id,))
         return row["title"] if row else None
 
     def get_session_title_source(self, session_id: str) -> Optional[str]:
         """Get the provenance of a session's title, or None when untitled."""
-        row = self._read_one("SELECT title, title_source FROM sessions WHERE id = ?", (session_id,))
+        row = self._read_one("SELECT title, title_source FROM sessions WHERE id = ? AND output_guarded=0", (session_id,))
         return row["title_source"] if row and row["title"] is not None else None
 
     def set_session_title_source(self, session_id: str, source: str) -> bool:

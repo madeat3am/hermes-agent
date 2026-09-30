@@ -48,6 +48,37 @@ class _StubAdapter(BasePlatformAdapter):
         return {"name": "test", "type": "direct", "chat_id": chat_id}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_retry", [False, True])
+@pytest.mark.parametrize("acceptance,error,retryable", [
+    ("unknown", "malformed acknowledgment", False),
+    ("unknown", "ConnectError", True),
+    ("partial", "some parts accepted", True),
+    (None, "ReadTimeout: request timed out", False),
+    ("rejected", "permission denied", False),
+    (None, "unclassified failure", False),
+])
+async def test_no_blind_resend_after_unsafe_outcome(first_retry, acceptance, error, retryable):
+    adapter = _StubAdapter()
+    unsafe = SendResult(success=False, error=error, retryable=retryable, acceptance=acceptance)
+    adapter._send_results = ([SendResult(success=False, error="ConnectError", retryable=True)]
+                             if first_retry else []) + [unsafe]
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        result = await adapter._send_with_retry("chat", "complete report")
+    assert result is unsafe
+    assert adapter._send_calls == [("chat", "complete report")] * (2 if first_retry else 1)
+
+
+@pytest.mark.asyncio
+async def test_typed_format_rejection_can_fallback_without_matching_text():
+    adapter = _StubAdapter()
+    adapter._send_results = [SendResult(success=False, error="opaque provider code",
+                                       error_kind="bad_format", acceptance="rejected")]
+    result = await adapter._send_with_retry("chat", "**report**")
+    assert result.success
+    assert len(adapter._send_calls) == 2
+
+
 # ---------------------------------------------------------------------------
 # _is_retryable_error
 # ---------------------------------------------------------------------------

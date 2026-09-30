@@ -219,6 +219,8 @@ def _escape_unresolved_presentation_mention(content: str, error: str) -> Optiona
 
 
 _FETCH_LIMIT = 50  # events per poll / seed call
+_FETCH_MAX_LIMIT = 200  # native buzz-cli cmd_get_messages cap
+_CATCHUP_MAX_PAGES = 10
 _SEEN_CAP = 500  # per-channel de-dupe set bound (events)
 _CURSOR_STATE_SUBDIR = "buzz"  # per-channel cursors survive a restart under HERMES_HOME
 _CURSOR_STATE_FILENAME = "channel-cursors.json"
@@ -936,17 +938,19 @@ class BuzzAdapter(BasePlatformAdapter):
         for pk in mention_pubkeys or []:
             mention_args += ["--mention", pk]
         code, out, err = await self._run_cli(args + mention_args, input_text=content)
-        if code == 0:
+        # Only exit 1 proves preflight rejection. Relay/unknown outcomes must
+        # stop every recovery rung, even when their text resembles preflight.
+        if code != 1:
             return code, out, err
         if mention_args and "not channel members" in (err or ""):
             code, out, err = await self._run_cli(args, input_text=content)
-            if code == 0:
+            if code != 1:
                 return code, out, err
         escaped = _escape_unresolved_presentation_mention(content, err)
         if escaped is not None:
             logger.info("Buzz: retrying message after unresolved presentation-mention preflight")
             code, out, err = await self._run_cli(args, input_text=escaped)
-            if code == 0:
+            if code != 1:
                 return code, out, err
         if "does not match a current channel member" in (err or "") and getattr(self, "_self_pubkey", None):
             code, out, err = await self._run_cli(args + ["--mention", self._self_pubkey], input_text=content)
@@ -975,16 +979,22 @@ class BuzzAdapter(BasePlatformAdapter):
     def _send_result(self, chat_id: str, code: int, out: str, err: str, *, redact_path: Optional[Path] = None) -> SendResult:
         """``messages send`` result -> SendResult; marks the verified id seen (echo suppression belt-and-braces)."""
         if code != 0:
-            return SendResult(success=False, error=_cli_error_message(err, code, redact_path=redact_path), retryable=code == 2)
+            # Exit 2 conflates relay rejection and a lost publish response. Without
+            # a stable signed event id exposed by the CLI, another invocation is unsafe.
+            return SendResult(success=False, error=_cli_error_message(err, code, redact_path=redact_path),
+                              acceptance="not_attempted" if code == 1 else "unknown")
         event_id, receipt_error = _parse_send_receipt(out)
         if receipt_error:
-            return SendResult(success=False, error=receipt_error)
+            data = _json_or(out, None)
+            rejected = isinstance(data, dict) and data.get("accepted") is False
+            return SendResult(success=False, error=receipt_error,
+                              acceptance="rejected" if rejected else "unknown")
         assert event_id is not None
         # Belt-and-braces echo suppression: the poll loop already skips our own pubkey, but marking the
         # verified id seen makes de-dupe explicit. Also record event_meta so a thread reply to this send
         # matches even if the WS/poll echo never arrives (#75826).
         self._mark_seen(str(chat_id), event_id)
-        return SendResult(success=True, message_id=event_id)
+        return SendResult(success=True, message_id=event_id, acceptance="accepted")
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Buzz has no typing indicator API — no-op."""
@@ -1361,6 +1371,8 @@ class BuzzAdapter(BasePlatformAdapter):
             raw_seen = entry.get("seen")
             seen = [str(event_id) for event_id in raw_seen][-_SEEN_CAP:] if isinstance(raw_seen, list) else []
             self._restored_cursors[str(channel_id)] = {"chat_type": str(entry.get("chat_type") or ""), "last_ts": last_ts, "seen": seen}
+            self._restored_cursors[str(channel_id)]["backlog"] = str(entry.get("backlog") or "")[:80]
+            self._restored_cursors[str(channel_id)]["admission_unknown"] = bool(entry.get("admission_unknown"))
 
     def _save_cursors(self) -> None:
         """Persist every watched channel's cursor.  Never raises."""
@@ -1368,6 +1380,8 @@ class BuzzAdapter(BasePlatformAdapter):
             channel_id: {
                 "chat_type": state.get("chat_type") or "group", "last_ts": int(state.get("last_ts") or 0),
                 "seen": list(state.get("seen") or ()),
+                "backlog": state.get("backlog") or "",
+                "admission_unknown": bool(state.get("admission_unknown")),
             }
             for channel_id, state in self._channel_state.items()
         }
@@ -1396,6 +1410,8 @@ class BuzzAdapter(BasePlatformAdapter):
             return False
         state = self._new_channel_state(restored["chat_type"] or chat_type)
         state["last_ts"] = restored["last_ts"]
+        state["backlog"] = restored.get("backlog") or ""
+        state["admission_unknown"] = bool(restored.get("admission_unknown"))
         state["seen"] = OrderedDict((event_id, None) for event_id in restored["seen"])
         self._channel_state[channel_id] = state
         return True
@@ -1472,24 +1488,95 @@ class BuzzAdapter(BasePlatformAdapter):
         state = self._channel_state.get(channel_id)
         if state is None:
             return
-        args = ["messages", "get", "--channel", channel_id, "--limit", str(_FETCH_LIMIT)]
-        if state["last_ts"]:
-            # Nostr `since` is inclusive: same-second events re-fetch and de-dupe by id.
-            args += ["--since", str(state["last_ts"])]
-        code, out, err = await self._run_cli(args)
-        if code != 0:
-            logger.debug("Buzz: poll of channel %s failed — %s", channel_id, _cli_error_message(err, code))
-            return
-        await self._handle_events(channel_id, state, _parse_json_list(out))
+        # buzz-cli cmd_get_messages maps --before to inclusive Nostr until and
+        # caps --limit at 200. Gather a complete bounded window BEFORE dispatch:
+        # CLI output is ascending, but the relay limits the newest events first.
+        since, before, limit = state["last_ts"], None, _FETCH_LIMIT
+        collected = {}
+        for _page in range(_CATCHUP_MAX_PAGES):
+            args = ["messages", "get", "--channel", channel_id, "--limit", str(limit)]
+            if since:
+                args += ["--since", str(since)]
+            if before is not None:
+                args += ["--before", str(before)]
+            code, out, err = await self._run_cli(args)
+            if code != 0:
+                logger.debug("Buzz: poll of channel %s failed — %s", channel_id, _cli_error_message(err, code))
+                self._hold_backlog(channel_id, state, "fetch_failed")
+                return
+            try:
+                events = json.loads(out)
+                if not isinstance(events, list):
+                    raise ValueError("fetch is not an event list")
+                for event in events:
+                    if (not isinstance(event, dict)
+                            or not all(isinstance(event.get(k), str) and event[k].strip()
+                                       for k in ("id", "pubkey"))
+                            or not isinstance(event.get("content"), str)
+                            or type(event.get("created_at")) is not int or event["created_at"] < 0
+                            or type(event.get("kind")) is not int or event["kind"] < 0
+                            or not isinstance(event.get("tags"), list)
+                            or not all(isinstance(tag, list) and all(isinstance(v, str) for v in tag)
+                                       for tag in event["tags"])):
+                        raise ValueError("invalid fetch event")
+            except (ValueError, TypeError):
+                # A filtered/malformed page cannot prove the window is complete.
+                self._hold_backlog(channel_id, state, "fetch_invalid")
+                return
+            for event in events:
+                collected[event["id"]] = event
+            if len(collected) > _SEEN_CAP:
+                self._hold_backlog(channel_id, state, "capacity_bound")
+                return
+            if len(events) < limit:
+                await self._handle_events(channel_id, state, sorted(collected.values(),
+                    key=lambda e: (int(e.get("created_at") or 0), str(e.get("id") or ""))), checkpoint=True)
+                return
+            oldest = min(int(e.get("created_at") or 0) for e in events)
+            if before is not None and oldest >= before:
+                if limit == _FETCH_MAX_LIMIT:
+                    self._hold_backlog(channel_id, state, "timestamp_saturated")
+                    return
+                limit = _FETCH_MAX_LIMIT
+            # Inclusive overlap is essential: never subtract one from oldest.
+            before = oldest
+        self._hold_backlog(channel_id, state, "page_bound")
 
-    async def _handle_events(self, channel_id: str, state: dict, events: List[dict]) -> None:
-        """Handle a batch, trim, and persist only when the cursor moved (idle channels don't rewrite the file)."""
-        before = self._cursor_mark(state)
-        for event in events:
-            await self._handle_event(channel_id, state, event)
-        self._trim_seen(state)
-        if self._cursor_mark(state) != before:
+    def _hold_backlog(self, channel_id: str, state: dict, reason: str) -> None:
+        if state.get("backlog") != reason:
+            state["backlog"] = reason
             self._save_cursors()
+            logger.warning("Buzz: catch-up incomplete for %s (%s); cursor held", channel_id, reason)
+
+    async def _handle_events(self, channel_id: str, state: dict, events: List[dict], *, checkpoint: bool = False) -> None:
+        """Only a complete poll window may move the checkpoint; WS arrival order proves no coverage."""
+        before = self._cursor_mark(state)
+        old_backlog = state.get("backlog") or ""
+        try:
+            # A cancelled native effect has no safe replay or checkpoint. Keep one
+            # bounded channel hold in the existing cursor owner, including reconnects.
+            if state.get("admission_unknown"):
+                self._hold_backlog(channel_id, state, "admission_unknown")
+                return
+            for event in events:
+                if not await self._handle_event(channel_id, state, event):
+                    self._hold_backlog(channel_id, state,
+                                       "admission_unknown" if state.get("admission_unknown") else "admission_pending")
+                    return
+            if state.get("admission_unknown"):
+                self._hold_backlog(channel_id, state, "admission_unknown")
+                return
+            if checkpoint:
+                state["last_ts"] = max([state["last_ts"], *(int(e.get("created_at") or 0) for e in events)])
+                state["backlog"] = ""
+        except BaseException:
+            self._hold_backlog(channel_id, state,
+                               "admission_unknown" if state.get("admission_unknown") else "admission_failed")
+            raise
+        finally:
+            self._trim_seen(state)
+            if self._cursor_mark(state) != before or state.get("backlog") != old_backlog:
+                self._save_cursors()
 
     @staticmethod
     def _parse_imeta_attachments(event: dict) -> Tuple[List[dict], int]:
@@ -1592,14 +1679,37 @@ class BuzzAdapter(BasePlatformAdapter):
     async def _cache_inbound_attachments(self, metadata_items: List[dict]) -> List[CachedMedia]:
         return [a for m in metadata_items if (a := await self._download_attachment(m)) is not None]
 
-    async def _handle_event(self, channel_id: str, state: dict, event: dict) -> None:
-        """De-dupe, filter, and dispatch a single ``messages get`` event."""
+    async def _handle_event(self, channel_id: str, state: dict, event: dict) -> bool:
+        """Claim independently of acceptance, so failures remain replayable without racing WS/poll."""
+        if state.get("admission_unknown"):
+            return False
+        event_id = str(event.get("id") or "")
+        if not event_id or event_id in state["seen"]:
+            return True
+        inflight = state.setdefault("inflight", set())
+        if event_id in inflight:
+            return False
+        inflight.add(event_id)
+        try:
+            accepted = await self._accept_event(channel_id, state, event)
+            if accepted is False:
+                return False
+            state["seen"][event_id] = None
+            # The optional reaction must not turn cancellation AFTER admission
+            # into a replayable event and a second active dispatch.
+            if accepted is True:
+                try:
+                    await self.send_reaction(channel_id, event_id, "👀")
+                except Exception:
+                    logger.debug("Buzz: reaction failed for message %s", event_id[:12], exc_info=True)
+            return True
+        finally:
+            inflight.discard(event_id)
+
+    async def _accept_event(self, channel_id: str, state: dict, event: dict) -> Optional[bool]:
+        """Filter or obtain the native gateway admission receipt (not a send acknowledgment)."""
         event_id = str(event.get("id") or "")
         created_at = int(event.get("created_at") or 0)
-        if not event_id or event_id in state["seen"]:
-            return
-        state["seen"][event_id] = None
-        state["last_ts"] = max(state["last_ts"], created_at)
         if int(event.get("kind") or 0) not in _DISPATCH_KINDS:
             return
         pubkey = str(event.get("pubkey") or "").lower()
@@ -1647,7 +1757,7 @@ class BuzzAdapter(BasePlatformAdapter):
             # Mixed kinds use document semantics so an audio member is not mistaken for a voice note (STT).
             kinds = {attachment.kind for attachment in attachments}
             message_type = _ATTACHMENT_KIND_TYPES.get(next(iter(kinds)), MessageType.DOCUMENT) if len(kinds) == 1 else MessageType.DOCUMENT
-        await self._dispatch_message(
+        return await self._dispatch_message(
             text=dispatch_text, chat_id=channel_id, chat_type=chat_type, user_id=pubkey,
             user_name=await self._resolve_user_name(pubkey), message_id=event_id,
             created_at=created_at, thread_id=thread_id, reply_to_message_id=reply_parent_id,
@@ -1874,10 +1984,10 @@ class BuzzAdapter(BasePlatformAdapter):
         reply_to_author_id: Optional[str] = None, reply_to_is_own_message: bool = False,
         media_urls: Optional[List[str]] = None, media_types: Optional[List[str]] = None,
         message_type: MessageType = MessageType.TEXT, raw_message: Any = None,
-    ) -> None:
+    ) -> bool:
         """Build a MessageEvent and hand it to the base class handler."""
         if not self._message_handler:
-            return
+            return False
         media_urls = list(media_urls or [])
         media_types = list(media_types or [])
         # Same-relay URL refs are localized in addition to the caller's imeta attachments (both explicit-True gated).
@@ -1898,17 +2008,27 @@ class BuzzAdapter(BasePlatformAdapter):
         )
         event = MessageEvent(
             text=text, message_type=message_type, source=source, raw_message=raw_message, message_id=message_id,
+            user_id=user_id, user_name=user_name,
             media_urls=list(media_urls), media_types=list(media_types), media_text_inlined=[False] * len(media_urls),
             timestamp=datetime.fromtimestamp(created_at) if created_at else datetime.now(),
             reply_to_message_id=reply_to_message_id, reply_to_text=reply_to_text,
             reply_to_author_id=reply_to_author_id, reply_to_is_own_message=reply_to_is_own_message,
         )
-        await self.handle_message(event)
-        # "Seen" reaction: signals the message was received and is being processed.
         try:
-            await self.send_reaction(chat_id, message_id, "👀")
-        except Exception:
-            logger.debug("Buzz: reaction failed for message %s", message_id[:12], exc_info=True)
+            await self.handle_message(event)
+        finally:
+            # Inline handling can succeed before an optional reply is cancelled.
+            # Consume the native receipt even while unwinding; never infer it from None.
+            if event._gateway_accepted is True:
+                state = self._channel_state.get(chat_id)
+                if state is not None:
+                    state["seen"][message_id] = None
+            elif (event._gateway_effect_started is True or
+                  (event._gateway_inline_entered and event._gateway_effect_started is not False)):
+                state = self._channel_state.get(chat_id)
+                if state is not None:
+                    state["admission_unknown"] = True
+        return event._gateway_accepted is True
 
 
 # ── Plugin registration ──────────────────────────────────────────────────────
@@ -2051,21 +2171,25 @@ async def _standalone_send(
         args += ["--file", str(media[0] if isinstance(media, (list, tuple)) and media else media)]
     try:
         code, out, err = await _exec_buzz(cli_path, args, relay_url=relay, private_key=private_key, auth_tag=auth_tag, input_text=message)
-        escaped = _escape_unresolved_presentation_mention(message, err) if code != 0 else None
+        escaped = _escape_unresolved_presentation_mention(message, err) if code == 1 else None
         if escaped is not None:
             logger.info("Buzz: retrying standalone message after unresolved presentation-mention preflight")
-            # Retry intentionally omits auth_tag (legacy behavior).
-            code, out, err = await _exec_buzz(cli_path, args, relay_url=relay, private_key=private_key, input_text=escaped)
+            # This validation precedes message publication, not necessarily file uploads.
+            code, out, err = await _exec_buzz(cli_path, args, relay_url=relay, private_key=private_key, auth_tag=auth_tag, input_text=escaped)
     except asyncio.CancelledError:
         raise
     except OSError as e:
         return {"error": f"Buzz standalone send failed to launch CLI: {_bounded_cli_message(str(e))}"}
     if code != 0:
-        return {"error": f"Buzz standalone send failed: {_cli_error_message(err, code)}"}
+        return {"error": f"Buzz standalone send failed: {_cli_error_message(err, code)}",
+                "acceptance": "not_attempted" if code == 1 else "unknown", "retryable": False}
     event_id, receipt_error = _parse_send_receipt(out)
     if receipt_error:
-        return {"error": f"Buzz standalone send failed: {receipt_error}"}
-    result = {"success": True, "message_id": event_id}
+        data = _json_or(out, None)
+        rejected = isinstance(data, dict) and data.get("accepted") is False
+        return {"error": f"Buzz standalone send failed: {receipt_error}",
+                "acceptance": "rejected" if rejected else "unknown", "retryable": False}
+    result = {"success": True, "message_id": event_id, "acceptance": "accepted", "retryable": False}
     if media_files:
         result["media_delivered"] = True
     return result

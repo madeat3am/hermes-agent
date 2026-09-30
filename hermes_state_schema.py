@@ -858,10 +858,14 @@ class SessionSchemaMixin:
         # loops for a rare failure mode.
         report_startup_progress(600.0, phase="state_db_init_schema")
         cursor = self._conn.cursor()
+        from hermes_state_output_release import reject_legacy_output_release
+        reject_legacy_output_release(cursor)
         cursor.executescript(SCHEMA_SQL)
 
         # Column reconciliation, then the two table-shape repairs ADD COLUMN cannot express.
         self._reconcile_columns(cursor)
+        from hermes_state_output_release import install_output_release_triggers
+        install_output_release_triggers(cursor)
         self._heal_gateway_routing_pk(cursor)
         # Rebuild session_model_usage if its PRIMARY KEY lacks the ``task`` column (5-column PK on installs
         # already at v22+ when the column landed — the version-gated rebuild is unreachable there, #73823).

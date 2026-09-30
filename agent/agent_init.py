@@ -1971,16 +1971,22 @@ def _inject_context_engine_tools(agent):
                 _names.add(_tname)
 
     if agent.context_compressor:
-        try:
-            agent.context_compressor.on_session_start(
-                agent.session_id, hermes_home=str(get_hermes_home()),
-                platform=agent.platform or "cli", model=agent.model,
-                context_length=getattr(agent.context_compressor, "context_length", 0),
-                conversation_id=getattr(agent, "_gateway_session_key", None),
-            )
-        except Exception as _ce_err:
-            _ra().logger.debug("Context engine on_session_start: %s", _ce_err)
+        if getattr(agent, "_required_output_release_policy", None) is not None:
+            agent._output_release_pending_context_start = True
+            return
+        _start_context_engine_session(agent)
 
+
+def _start_context_engine_session(agent):
+    try:
+        agent.context_compressor.on_session_start(
+            agent.session_id, hermes_home=str(get_hermes_home()),
+            platform=agent.platform or "cli", model=agent.model,
+            context_length=getattr(agent.context_compressor, "context_length", 0),
+            conversation_id=getattr(agent, "_gateway_session_key", None),
+        )
+    except Exception as _ce_err:
+        _ra().logger.debug("Context engine on_session_start: %s", _ce_err)
 
 def _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length):
     # Ollama defaults num_ctx to 2048, so detect the max window and send num_ctx per request.
@@ -2223,6 +2229,40 @@ def init_agent(
       skip_context_files: skip SOUL.md/.hermes.md/AGENTS.md/CLAUDE.md/.cursorrules injection;
         load_soul_identity keeps ~/.hermes/SOUL.md as identity regardless.
     """
+    # Resolve the security switch before routing, clients or model-capable plugins.
+    # A parse/load failure must not turn a required gate into ordinary mode.
+    try:
+        from hermes_cli.config import load_config_readonly as _load_agent_config
+        import re
+        _agent_cfg = _load_agent_config()
+        if not isinstance(_agent_cfg, dict):
+            raise ValueError()
+        section = _agent_cfg.get("agent") or {}
+        if not isinstance(section, dict):
+            raise ValueError()
+        release_config = section.get("output_release")
+        required_policy = None
+        if release_config is not None:
+            if not isinstance(release_config, dict) or set(release_config) - {"required_policy"}:
+                raise ValueError()
+            required_policy = release_config.get("required_policy")
+            if required_policy is not None and (
+                not isinstance(required_policy, str)
+                or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_-]+", required_policy)
+            ):
+                raise ValueError()
+        agent._required_output_release_policy = required_policy
+    except Exception:
+        raise ValueError("Output release configuration invalid") from None
+
+    if required_policy is not None:
+        from hermes_cli.plugins import get_plugin_manager
+        manager = get_plugin_manager()
+        # Registration uses the existing profile-scoped plugin lifecycle. Do not
+        # initialize clients, tools or memory to discover a missing authority.
+        if required_policy not in getattr(manager, "_output_release_policies", {}):
+            raise ValueError("Required output release authority unavailable")
+
     _install_safe_stdio()
 
     _params = locals()
@@ -2284,13 +2324,7 @@ def init_agent(
         checkpoints_enabled, checkpoint_max_snapshots, checkpoint_max_total_size_mb, checkpoint_max_file_size_mb,
     )
 
-    # Load config once for memory, skills, and compression sections
-    try:
-        from hermes_cli.config import load_config_readonly as _load_agent_config
-        _agent_cfg = _load_agent_config()
-    except Exception:
-        _agent_cfg = {}
-
+    # Reuse the validated configuration frozen before initialization.
     _apply_display_config(agent, _agent_cfg, platform)
     _init_memory(agent, _agent_cfg, skip_memory, platform)
     _apply_agent_section(agent, _agent_cfg)

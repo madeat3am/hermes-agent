@@ -424,7 +424,7 @@ def is_host_excluded_by_no_proxy(hostname: str, no_proxy_value: str | None = Non
 import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union, Literal
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -1572,6 +1572,10 @@ class SendResult:
     # SEND_ERROR_KINDS member (failures only) via :func:`classify_send_error`, so consumers
     # branch without substring-matching ``error``.
     error_kind: Optional[str] = None
+    # None preserves legacy adapters; unknown/partial acceptance forbids blind resend.
+    acceptance: Optional[Literal["accepted", "rejected", "not_attempted", "partial", "unknown"]] = None
+    # Ordered receipts for multipart sends; never retry the whole batch from success alone.
+    parts: Tuple["SendResult", ...] = ()
 
 
 # Longest server ``retry_after`` ``_send_with_retry`` will sleep inline. Longer penalties return the
@@ -2575,6 +2579,7 @@ class BasePlatformAdapter(ABC):
         aggregate, or a media-only turn on that platform reports FAILURE (#106153)."""
         from urllib.parse import unquote as _unquote
         delivered = False
+        parts = []
         for image_url, alt_text in images:
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
@@ -2589,16 +2594,26 @@ class BasePlatformAdapter(ABC):
                     sender, url_kw = self.send_image, {"image_url": image_url}
                 img_result = await sender(
                     chat_id=chat_id, **url_kw, caption=alt_text or None, metadata=metadata)
+                parts.append(img_result)
                 if not img_result.success:
                     logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
                 else:
                     delivered = True
             except Exception as img_err:
+                parts.append(SendResult(success=False, error=str(img_err), acceptance="unknown"))
                 logger.error("[%s] Error sending image: %s", self.name, img_err, exc_info=True)
         if not images:
             return SendResult(success=False, error="no images to send")
+        states = {p.acceptance or ("accepted" if p.success else "unknown") for p in parts}
+        if len(states) == 1:
+            acceptance = next(iter(states))
+        elif states & {"accepted", "partial"}:
+            acceptance = "partial"
+        else:
+            acceptance = "unknown" if "unknown" in states else "rejected"
         return SendResult(
             success=delivered,
+            acceptance=acceptance, parts=tuple(parts), retryable=False,
             error=None if delivered else "all images failed to send")
 
     async def send_image(
@@ -3120,7 +3135,16 @@ class BasePlatformAdapter(ABC):
         """Call the handler and send its reply inline, with retry, threading and
         ephemeral deletion — no session lifecycle (active-session bypass paths)."""
         thread_meta = _thread_metadata_for_event(event)
-        response = await self._message_handler(event)
+        handler = self._message_handler
+        if handler is None:
+            return
+        event._gateway_inline_entered = True
+        response = await handler(event)
+        # Native effectful handlers issue their receipt before post-effect awaits;
+        # return is the fallback admission boundary for legacy/read-only handlers.
+        # A callback with arbitrary side effects must implement MessageEvent's
+        # effect-start/commit contract; exceptions alone cannot reveal its outcome.
+        event._gateway_accepted = True
         text, eph_ttl = self._unwrap_ephemeral(response)
         if not text:
             return
@@ -3152,12 +3176,16 @@ class BasePlatformAdapter(ABC):
     async def _send_with_retry(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Any = None,
         max_retries: int = 2, base_delay: float = 2.0) -> "SendResult":
-        """Send with exponential-backoff retry on transient network errors; permanent
-        failures fall back to a plain-text send, exhausted retries notify the user."""
+        """Retry known transient failures; only format rejection permits plaintext fallback.
+
+        Unknown/partial acceptance takes precedence over retry hints on every attempt.
+        """
         async def _send(text: str) -> "SendResult":
             return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
         result = await _send(content)
         if result.success:
+            return result
+        if result.acceptance in ("unknown", "partial", "accepted"):
             return result
         error_str = result.error or ""
         # A rate-limited / flood-capped send is transient: it should back off
@@ -3202,7 +3230,11 @@ class BasePlatformAdapter(ABC):
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
+                if result.acceptance in ("unknown", "partial", "accepted"):
+                    return result
                 error_str = result.error or ""
+                if self._is_timeout_error(error_str) and not result.retryable and result.retry_after is None:
+                    return result
                 if result.retry_after is not None:
                     server_retry_after = result.retry_after
                 # The failure kind can change between attempts (a transient error may
@@ -3242,9 +3274,10 @@ class BasePlatformAdapter(ABC):
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
-        # Non-network / post-retry formatting failure: try plain text as fallback. A
-        # rate-limited error never reaches here: it classifies as network above and the
-        # loop only breaks on a non-transient, non-rate-limited error.
+        # Absence of a transient classification is not evidence of format rejection.
+        kind = result.error_kind or classify_send_error(None, error_str)
+        if kind not in ("bad_format", "too_long"):
+            return result
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
         fallback_result = await _send(f"(Response formatting failed, plain text:)\n\n{content[:3500]}")
         if not fallback_result.success:
@@ -3476,7 +3509,7 @@ class BasePlatformAdapter(ABC):
             # confirmation.
             await self._dispatch_inline_reply(event, log_cmd=cmd)
             await self.cancel_session_processing(session_key, release_guard=False, discard_pending=False)
-        except Exception:
+        except BaseException:
             # On failure restore the original guard so the session isn't left half-reset.
             if self._active_sessions.get(session_key) is command_guard:
                 if session_key in self._session_tasks and current_guard is not None:

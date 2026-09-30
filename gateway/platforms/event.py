@@ -86,6 +86,12 @@ class MessageEvent:
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
+    # Trusted native effect receipt: None=unreported, False=explicitly no effect yet,
+    # True=effect started (including off-loop work). Never downgrade True to False.
+    # Set _gateway_accepted at commit, before optional hooks/replies. An entered
+    # uninstrumented callback that unwinds is UNKNOWN, not safely replayable.
+    _gateway_effect_started: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
+    _gateway_inline_entered: bool = field(default=False, init=False, repr=False, compare=False)
 
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""

@@ -32,6 +32,12 @@ def prepare_send_message_platforms() -> None:
 
 def send_message_tool(args, **kw):
     """Handle cross-channel send_message tool calls."""
+    from agent.subagent_lifecycle import get_active_subagent_parent
+    parent = get_active_subagent_parent()
+    if getattr(parent, "_required_output_release_policy", None) is not None:
+        # No immutable attachment/reference authorization exists. Never publish
+        # from a guarded execution context, even after its final release.
+        return json.dumps({"error": "Output withheld."})
     action = args.get("action", "send")
     if action == "list":
         return _handle_list()

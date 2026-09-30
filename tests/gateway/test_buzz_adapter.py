@@ -3305,7 +3305,7 @@ class TestStandaloneSend:
         monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
 
         result = await _standalone_send(PlatformConfig(enabled=True, extra={}), CHANNEL, "cron says hi")
-        assert result == {"success": True, "message_id": "evt-cron"}
+        assert result == {"success": True, "message_id": "evt-cron", "acceptance": "accepted", "retryable": False}
         assert captured["args"][:2] == ["messages", "send"]
         assert captured["input_text"] == "cron says hi"
         # The private key must never be part of argv
@@ -3355,7 +3355,7 @@ class TestStandaloneSend:
         result = await _standalone_send(
             PlatformConfig(enabled=True, extra={}), CHANNEL, "cron needs owner auth"
         )
-        assert result == {"success": True, "message_id": "evt-auth"}
+        assert result == {"success": True, "message_id": "evt-auth", "acceptance": "accepted", "retryable": False}
         assert captured["private_key"] == "nsec1fromfile"
         assert json.loads(captured["auth_tag"]) == tag
         # Secrets stay out of argv (auth_tag is env-injected by _exec_buzz).
@@ -3398,7 +3398,7 @@ class TestStandaloneSend:
         result = await _standalone_send(
             PlatformConfig(enabled=True, extra={}), CHANNEL, "key only"
         )
-        assert result == {"success": True, "message_id": "evt-key"}
+        assert result == {"success": True, "message_id": "evt-key", "acceptance": "accepted", "retryable": False}
         assert captured["private_key"] == "nsec1x"
         assert captured["auth_tag"] == ""
 
@@ -3449,7 +3449,7 @@ class TestStandaloneSend:
             "See @session:default/example.",
         )
 
-        assert result == {"success": True, "message_id": "evt-standalone"}
+        assert result == {"success": True, "message_id": "evt-standalone", "acceptance": "accepted", "retryable": False}
         assert sent == [
             "See @session:default/example.",
             "See @\u200bsession:default/example.",
@@ -3486,6 +3486,8 @@ class TestStandaloneSend:
             "success": True,
             "message_id": "evt-media",
             "media_delivered": True,
+            "acceptance": "accepted",
+            "retryable": False,
         }
         file_index = captured["args"].index("--file")
         assert captured["args"][file_index + 1] == str(document)
@@ -3652,7 +3654,8 @@ class TestBuzzAdapterEdit:
             PlatformConfig(enabled=True, extra={}), CHANNEL, "hello"
         )
 
-        assert result == {"error": "Buzz standalone send failed: invalid CLI response"}
+        assert result == {"error": "Buzz standalone send failed: invalid CLI response",
+                          "acceptance": "unknown", "retryable": False}
 
     @pytest.mark.asyncio
     async def test_standalone_send_rejection_is_useful_bounded_and_not_delivered(

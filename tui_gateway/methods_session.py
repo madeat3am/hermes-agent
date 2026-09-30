@@ -1648,7 +1648,9 @@ def _(rid, params: dict, session: dict) -> dict:
 
 @_session_method("session.history")
 def _(rid, params: dict, session: dict) -> dict:
-    history = list(session.get("history", []))
+    # Guarded in-memory history is trusted replay, never a public fallback.
+    guarded = getattr(session.get("agent"), "_required_output_release_policy", None) is not None
+    history = [] if guarded else list(session.get("history", []))
     if session.get("session_key"):
         with _session_db(session) as db:
             if db is not None:

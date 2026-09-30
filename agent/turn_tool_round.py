@@ -63,6 +63,17 @@ def run_tool_round(
             truncated_tool_call_retries=truncated_tool_call_retries, result=result,
         )
 
+    from agent.output_release import read_batch_allowed
+    if (getattr(agent, "_required_output_release_policy", None) is not None
+            and not read_batch_allowed(agent, assistant_message.tool_calls)):
+        # Unknown and effect-capable batches remain denied before any preview.
+        append_message(messages, agent._build_assistant_message(assistant_message, finish_reason))
+        for tc in assistant_message.tool_calls:
+            append_message(messages, {"role": "tool", "name": tc.function.name,
+                "tool_call_id": coalesce_tool_call_id(tc), "content": "Output withheld."})
+        final_response, failed, _turn_exit_reason = "Output withheld.", True, "output_release_tool_blocked"
+        return _verdict("break")
+
     if not agent.quiet_mode:
         agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")
 
@@ -260,7 +271,8 @@ def stage_tool_call_message(
         agent._last_content_tools_all_housekeeping = _all_housekeeping
         if _all_housekeeping and agent._has_stream_consumers():
             agent._mute_post_response = True
-        elif agent._should_emit_quiet_tool_messages():
+        elif (getattr(agent, "_required_output_release_policy", None) is None
+              and agent._should_emit_quiet_tool_messages()):
             clean = agent._strip_think_blocks(turn_content).strip()
             if clean:
                 agent._vprint(f"  ┊ 💬 {clean}")

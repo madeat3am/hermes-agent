@@ -890,6 +890,11 @@ class PluginContext:
         logger.debug("Plugin %s registered %d redaction pattern(s)", self.manifest.name, count)
         return count
 
+    def register_output_release_policy(self, *, id, version=1, prepare, decide) -> PluginRegistration:
+        """Register an owned experimental final-output authority; unload revokes it."""
+        from agent.output_release import register_policy
+        return register_policy(self, id=id, version=version, prepare=prepare, decide=decide)
+
     def register_hook(self, hook_name: str, callback: Callable) -> PluginRegistration:
         """Register a lifecycle hook callback (unknown names warn but are still stored)."""
         return self._track_callback("hook", hook_name, callback, self._manager._hooks, VALID_HOOKS)

@@ -393,12 +393,15 @@ class SessionDB(
         )
 
     @staticmethod
-    def _session_row_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    def _session_row_dict(row: sqlite3.Row, *, trusted_raw=False) -> Dict[str, Any]:
         data = dict(row)
         if "_system_prompt_resolved" in data:
             resolved = data.pop("_system_prompt_resolved")
             if "system_prompt" in data:
                 data["system_prompt"] = resolved
+        if data.get("output_guarded") and not trusted_raw:
+            from hermes_state_output_release import public_session_metadata
+            data = public_session_metadata(data)
         return data
 
     @staticmethod
@@ -536,6 +539,8 @@ class SessionDB(
                 try:
                     apply_database_pragmas(conn, db_label="state.db")
                     cursor = conn.cursor()
+                    from hermes_state_output_release import reject_legacy_output_release
+                    reject_legacy_output_release(cursor)
                     self._fts_enabled = self._fts_table_probe(cursor, "messages_fts") is True
                     if self._fts_enabled:
                         self._trigram_available = (
